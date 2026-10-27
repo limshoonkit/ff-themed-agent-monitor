@@ -1,0 +1,43 @@
+{
+  "idle": [
+    "idle"
+  ],
+  "thinking": [
+    "running"
+  ],
+  "reading": [
+    "materia-study",
+    "running"
+  ],
+  "working": [
+    "bomb-combo",
+    "waiting"
+  ],
+  "delegating": [
+    "battle-stance",
+    "waiting"
+  ],
+  "compacting": [
+    "running"
+  ],
+  "waiting": [
+    "battle-stance",
+    "waiting"
+  ],
+  "background": [
+    "piano",
+    "idle"
+  ],
+  "ready": [
+    "victory",
+    "idle"
+  ],
+  "celebrate": [
+    "victory",
+    "idle"
+  ],
+  "failed": [
+    "hurt",
+    "failed"
+  ]
+}

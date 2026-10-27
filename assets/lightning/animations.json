@@ -1,0 +1,35 @@
+{
+  "idle": [
+    "idle"
+  ],
+  "background": [
+    "maintenance"
+  ],
+  "working": [
+    "psicom"
+  ],
+  "thinking": [
+    "datalog"
+  ],
+  "reading": [
+    "datalog"
+  ],
+  "compacting": [
+    "datalog"
+  ],
+  "waiting": [
+    "idle"
+  ],
+  "delegating": [
+    "odin"
+  ],
+  "ready": [
+    "idle"
+  ],
+  "celebrate": [
+    "idle"
+  ],
+  "failed": [
+    "hurt"
+  ]
+}

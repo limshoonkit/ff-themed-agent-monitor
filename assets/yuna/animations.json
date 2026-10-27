@@ -1,0 +1,35 @@
+{
+  "idle": [
+    "await-command"
+  ],
+  "background": [
+    "moogle"
+  ],
+  "working": [
+    "valefor"
+  ],
+  "thinking": [
+    "prayer"
+  ],
+  "reading": [
+    "prayer"
+  ],
+  "compacting": [
+    "prayer"
+  ],
+  "waiting": [
+    "await-command"
+  ],
+  "delegating": [
+    "valefor"
+  ],
+  "ready": [
+    "await-command"
+  ],
+  "celebrate": [
+    "await-command"
+  ],
+  "failed": [
+    "hurt"
+  ]
+}

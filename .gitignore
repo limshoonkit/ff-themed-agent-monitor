@@ -1,0 +1,26 @@
+# Personal character animations and source sheets stay local.
+/assets/**/*.gif
+/assets/**/*.ogg
+/assets/**/*.opus
+/assets/**/*.flac
+/assets/**/*.m4a
+/assets/**/*.wav
+/assets/**/*.mp3
+/artwork/**/*.png
+/artwork/**/*.json
+
+# Local state and Python build products.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.sqlite3
+*.sqlite3-*
+config.json
+limits.json
+monitor.log
+ui.json
+
+# Keep the intentionally small README preview in docs/demo.gif.
+# Its builder stays local.
+/docs/build_demo.py

@@ -1,0 +1,35 @@
+{
+  "idle": [
+    "await-command"
+  ],
+  "background": [
+    "angelo"
+  ],
+  "working": [
+    "blaster-bomb"
+  ],
+  "thinking": [
+    "briefing"
+  ],
+  "reading": [
+    "briefing"
+  ],
+  "compacting": [
+    "briefing"
+  ],
+  "waiting": [
+    "await-command"
+  ],
+  "delegating": [
+    "await-command"
+  ],
+  "ready": [
+    "await-command"
+  ],
+  "celebrate": [
+    "await-command"
+  ],
+  "failed": [
+    "hurt"
+  ]
+}

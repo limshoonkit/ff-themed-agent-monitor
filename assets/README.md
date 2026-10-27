@@ -1,0 +1,5 @@
+# Local avatar assets
+
+Character GIFs and MP3 themes are intentionally excluded from Git. The monitor reads them from `assets/<name>/` on your machine. Each avatar needs `idle.gif`, `running.gif`, `waving.gif`, `waiting.gif`, and `failed.gif`, or an `animations.json` whose state mappings resolve to available GIFs. Optional `variants.json` lists working animations to rotate during tool execution.
+
+The included animation profiles document the local characters used for development. On a fresh clone, copy your own GIFs into these directories or register another asset directory with `python3 scripts/monitor.py add-avatar NAME DIRECTORY`. See the root README for setup.
