@@ -2,5 +2,8 @@
   "working": [
     "psicom",
     "odin"
+  ],
+  "busy_shift": [
+    "paradigm-shift"
   ]
 }

@@ -171,6 +171,152 @@ class MonitorTests(unittest.TestCase):
         self.event('PreToolUse', tool_name='Bash', agent_id='background')
         self.assertEqual(self.state(), 'ready')
 
+    def test_only_the_waiter_clears_its_prompt(self):
+        self.event('UserPromptSubmit')
+        self.event('PreToolUse', tool_name='Agent', tool_input={'run_in_background': True})
+        self.event('SubagentStart', agent_id='bg')
+        self.event('PermissionRequest', tool_name='Bash')  # the main thread asks
+        for name in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure'):
+            self.event(name, tool_name='Read', agent_id='bg')  # background work goes on
+            self.assertEqual(self.state(), 'waiting')
+        self.event('SubagentStop', agent_id='bg')
+        self.event('Notification', notification_type='idle_prompt')
+        self.assertEqual(self.state(), 'waiting')
+        self.event('PostToolUse', tool_name='Bash')  # approved and run
+        self.assertEqual(self.state(), 'thinking')
+
+        # Two waiters at once: each answer clears only its own prompt, and Stop can't hide a subagent's.
+        self.event('SubagentStart', agent_id='a1')
+        self.event('PermissionRequest', tool_name='Edit', agent_id='a1')
+        self.event('PreToolUse', tool_name='AskUserQuestion')
+        self.event('PostToolUse', tool_name='AskUserQuestion')
+        self.assertEqual(self.state(), 'waiting')
+        self.event('Stop')
+        self.assertEqual(self.state(), 'waiting')
+        self.event('PostToolUse', tool_name='Edit', agent_id='a1')
+        self.assertEqual(json.loads(m.refresh_sessions()[0]['waiters']), [])
+        self.assertEqual(self.state(), 'delegating')
+
+        # A bare permission notice counts only when no request is known; Esc clears everything.
+        self.event('Stop')
+        self.event('Notification', notification_type='permission_prompt')
+        self.assertEqual(self.state(), 'waiting')
+        self.event('PermissionRequest', tool_name='Edit', agent_id='a2')
+        self.event('PostToolUseFailure', tool_name='Edit', is_interrupt=True)
+        self.assertEqual((self.state(), m.refresh_sessions()[0]['waiters']), ('idle', '[]'))
+
+    def test_session_health_and_flags(self):
+        health = lambda context, window=200_000, compactions=0, cfg={}: m.session_health(
+            {'context': context, 'window': window, 'compactions': compactions}, cfg)
+        self.assertEqual(health(50_000), ('fresh', 'context 50k · 25%'))
+        self.assertEqual(health(80_000)[0], 'long')  # 40% of 200k
+        self.assertEqual(health(150_000)[0], 'too long')  # 75%
+        self.assertEqual(health(160_000, 1_000_000)[0], 'long')  # 16% of 1M, but a big context all the same
+        self.assertEqual(health(320_000, 1_000_000)[0], 'too long')
+        self.assertEqual(health(30_000, compactions=1), ('long', 'context 30k · 15% · 1 compact'))
+        self.assertEqual(health(30_000, compactions=2)[0], 'too long')  # a summary of a summary
+        self.assertEqual(health(80_000, cfg={'context_warn': 50})[0], 'fresh')
+        self.assertEqual(m.session_health(None, {}), (None, ''))
+
+        # Per-turn counters reset when the turn ends; three errors in one turn flag it.
+        self.event('UserPromptSubmit')
+        for _ in range(3):
+            self.event('PreToolUse', tool_name='Bash')
+            self.event('PostToolUseFailure', tool_name='Bash')
+        row = m.refresh_sessions()[0]
+        self.assertEqual((row['turn_tools'], row['turn_errors'], row['tool_errors']), (3, 3, 3))
+        now = time.time()
+        self.assertEqual(m.session_flags(row, None, now, {}), ['3 tool errors this turn: check on it'])
+        long_turn = dict(row, turn_errors=0, turn_tools=55, turn_started=now - 1500)
+        self.assertEqual(m.session_flags(long_turn, None, now, {}), ['long turn: 25m, 55 tools'])
+        self.event('Stop')
+        row = m.refresh_sessions()[0]
+        self.assertEqual((row['turn_tools'], row['turn_errors'], row['tool_errors']), (0, 0, 3))
+        self.assertEqual(m.session_flags(row, None, now, {}), [])
+
+        # An idle chat with a big context: its prompt cache expires after five minutes.
+        usage = {'context': 180_000}
+        self.assertEqual(m.session_flags(dict(row, updated=now - 200), usage, now, {}), [])
+        self.assertEqual(m.session_flags(dict(row, updated=now - 400), usage, now, {}),
+                         ['cache cold: next turn re-reads 180k'])
+        self.assertEqual(m.session_flags(dict(row, updated=now - 400), {'context': 20_000}, now, {}), [])
+        self.assertEqual(m.session_flags(dict(row, state='working', updated=now - 400), usage, now, {}), [])
+
+    def test_remote_snapshot_rows_and_feed(self):
+        import subprocess, sys
+        self.event('UserPromptSubmit', sid='remote-chat')
+        self.event('PreToolUse', sid='remote-chat', tool_name='Bash')
+        snap = m.snapshot()
+        self.assertEqual(snap['version'], m.SNAPSHOT_VERSION)
+        session = json.loads(json.dumps(snap))['sessions'][0]  # plain JSON all the way down
+        self.assertEqual((session['id'], session['state'], session['usage']), ('remote-chat', 'working', None))
+
+        # Remote rows: namespaced IDs, times moved onto this clock, avatar and mute kept on this machine.
+        prefs, names = {}, ['Tifa', 'Rinoa']
+        rows = m.remote_rows('devbox', [session, dict(session, id='other')], 100.0, True, prefs, names)
+        self.assertEqual([r['id'] for r in rows], ['devbox/remote-chat', 'devbox/other'])
+        self.assertEqual((rows[0]['host'], rows[0]['short'], rows[0]['offline']), ('devbox', 'remote-c', False))
+        self.assertAlmostEqual(rows[0]['turn_started'], session['turn_started'] + 100)
+        self.assertEqual([r['avatar'] for r in rows], ['Tifa', 'Rinoa'])  # new chats rotate the catalog
+        prefs['devbox/remote-chat'].update(avatar='Rinoa', muted=1)
+        again = m.remote_rows('devbox', [session], 0.0, False, prefs, names)[0]
+        self.assertEqual((again['avatar'], again['muted'], again['offline']), ('Rinoa', 1, True))
+
+        # SSH targets can't smuggle options; names stay simple; a headless host never opens a window.
+        for bad in ('-oProxyCommand=touch /tmp/x', 'two words', ''):
+            self.assertRaises(ValueError, m.check_ssh_target, bad)
+        self.assertRaises(ValueError, m.remote_add, 'devbox', 'bad name!')
+        m.save_config({'enabled': True, 'headless': True, 'avatars': {}})
+        real_popen = m.subprocess.Popen
+        m.subprocess.Popen = lambda *a, **k: self.fail('a headless host launched the window')
+        try:
+            m.launch()
+        finally:
+            m.subprocess.Popen = real_popen
+
+        # The feed reads `snapshot watch` lines; here the "remote" is this script run directly, not over SSH.
+        remote = Path(self.tmp.name) / 'remote'
+        env = dict(AGENT_MONITOR_HOME=str(remote / 'state'), CLAUDE_CONFIG_DIR=str(remote / 'claude'),
+                   CODEX_HOME=str(remote / 'codex'))
+        data, m.DATA = m.DATA, remote / 'state'
+        self.event('UserPromptSubmit', sid='far-chat')
+        m.DATA = data
+        script = str(m.ROOT / 'scripts/monitor.py')
+        class Feed(m.RemoteFeed):
+            def command(self):
+                return [sys.executable, script, 'snapshot', 'watch']
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            feed = Feed('far', 'far')
+            for _ in range(100):
+                if feed.online:
+                    break
+                time.sleep(.1)
+            self.assertTrue(feed.online, feed.error)
+            self.assertEqual([s['id'] for s in feed.sessions], ['far-chat'])
+            self.assertLess(abs(feed.offset), 5)
+            feed.stop()
+            for _ in range(50):
+                if not feed.online:
+                    break
+                time.sleep(.1)
+            self.assertFalse(feed.online)
+            self.assertEqual([s['id'] for s in feed.sessions], ['far-chat'])  # last sessions stay, offline
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+        class Broken(m.RemoteFeed):
+            def command(self):
+                return [sys.executable, '-c', 'import sys; sys.stderr.write("Permission denied (publickey).\\n"); sys.exit(255)']
+        broken = Broken('down', 'down')
+        for _ in range(50):
+            if broken.error:
+                break
+            time.sleep(.1)
+        broken.stop()
+        self.assertEqual((broken.online, broken.error), (False, 'Permission denied (publickey).'))
+
     def test_turn_timing_counters_and_animation(self):
         self.event('UserPromptSubmit')
         with m.connect() as db:
@@ -347,6 +493,57 @@ class MonitorTests(unittest.TestCase):
         x1,y1,x2,y2 = fitted.getbbox()
         self.assertEqual((x2-x1)/(y2-y1), 2)
         self.assertEqual(fitted.width/fitted.height, 4/3)
+
+    def test_background_rotation_and_alerts_remain_predictable(self):
+        import random
+        rng = random.Random(7)
+        card = {}
+        first = m.choose_scene(card, 'Hero', 'background', ['rest', 'play'], 100, rng)
+        self.assertTrue(125 <= card['encounter_until'] <= 145)
+        self.assertEqual(m.choose_scene(card, 'Hero', 'background', ['rest', 'play'], 120, rng), first)
+        self.assertNotEqual(m.choose_scene(card, 'Hero', 'background', ['rest', 'play'], 146, rng), first)
+        self.assertEqual(m.choose_scene(card, 'Hero', 'waiting', ['wait'], 147, rng), ('Hero', 'waiting', 'wait'))
+        m.choose_scene(card, 'Hero', 'working', ['fight', 'cast'], 148, rng)
+        self.assertTrue(156 <= card['encounter_until'] <= 162)
+        folder = Path(self.tmp.name) / 'variants'; folder.mkdir()
+        for name in ('idle', 'play'):
+            (folder / (name + '.gif')).touch()
+        manifest = folder / 'variants.json'
+        manifest.write_text(json.dumps({'background': ['play'], 'waiting': ['play']}))
+        self.assertEqual([p.stem for p in m.scene_paths(folder, 'background')], ['idle', 'play'])
+        self.assertEqual([p.stem for p in m.scene_paths(folder, 'waiting')], ['idle'])
+        manifest.write_text(json.dumps({'busy_shift': ['../outside']}))
+        with self.assertRaises(ValueError):
+            m.variant_paths(folder, 'busy_shift')
+
+    def test_busy_shift_cooldown_and_immediate_alert_interrupt(self):
+        card = {'key': ('Lightning', 'thinking', 'datalog')}
+        shift = ('Lightning', 'busy_shift', 'shift')
+        choose = lambda state, now, avatar='Lightning': m.choose_transition(
+            card, avatar, state, (avatar, state, state), shift, now)
+        self.assertEqual(choose('thinking', 100), ('Lightning', 'thinking', 'thinking'))
+        self.assertEqual(choose('working', 101), shift)
+        card['key'] = shift
+        self.assertEqual(choose('reading', 102), shift)
+        self.assertEqual(card['restore_key'], ('Lightning', 'reading', 'reading'))
+        self.assertEqual(choose('waiting', 103), ('Lightning', 'waiting', 'waiting'))
+        self.assertNotIn('restore_key', card)
+        choose('working', 104)
+        self.assertEqual(choose('reading', 105), ('Lightning', 'reading', 'reading'))
+        self.assertEqual(choose('working', 132), shift)
+        self.assertEqual(choose('working', 133, 'Other'), ('Other', 'working', 'working'))
+        self.assertNotIn('restore_key', card)
+
+    def test_card_backdrops_follow_provider_and_keep_alert_borders(self):
+        moods = {'anthropic': 'battle', 'openai': 'boss'}
+        claude = {'provider': 'claude', 'state': 'waiting'}
+        codex = {'provider': 'codex', 'state': 'failed'}
+        self.assertEqual(m.card_palette(claude, moods, {'sound': False}),
+                         (m.CARD_BACKDROPS['battle'], m.COLORS['waiting']))
+        self.assertEqual(m.card_palette(codex, moods, {}),
+                         (m.CARD_BACKDROPS['boss'], m.COLORS['failed']))
+        self.assertEqual(m.card_palette(codex, moods, {'mood_backdrops': False}),
+                         ('#202a3d', m.COLORS['failed']))
 
     def test_neutral_idle_and_reading_are_separate(self):
         if not (m.ROOT / 'assets/tifa/idle.gif').exists():
@@ -603,7 +800,7 @@ class MonitorTests(unittest.TestCase):
         # Codex app servers hold a loaded thread's rollout open; this test process plays that role.
         m.CODEX_COMM = Path('/proc/self/comm').read_text().strip()
         chat, review = self.codex_rollout('codex-a'), self.codex_rollout('codex-review', source='guardian_review')
-        stamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+        stamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime(time.time() - 10))
         with open(chat, 'a') as f:
             f.write(json.dumps({'timestamp': stamp, 'type': 'event_msg', 'payload': {'type': 'task_started'}}) + '\n')
         with open(chat, 'rb'), open(review, 'rb'):
@@ -611,15 +808,24 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual([(r['id'], r['provider'], r['source'], r['state'], r['cwd']) for r in rows],
                              [('codex-a', 'codex', 'metadata', 'thinking', '')])
             self.assertTrue(m.status_text(rows[0]).endswith('detected'))
+            turn_start = rows[0]['turn_started']
+            self.assertEqual(turn_start, m.iso_ts(stamp))
+            self.assertFalse(m.music_started(rows[0], turn_start + 4, {}))
+            self.assertTrue(m.music_started(rows[0], turn_start + 6, {}))
             with open(chat, 'a') as f:  # a long turn: megabytes of tool output after task_started
                 for _ in range(7):
                     f.write(json.dumps({'timestamp': stamp, 'type': 'response_item',
                                         'payload': {'type': 'custom_tool_call_output', 'output': 'x' * (1 << 20)}}) + '\n')
             m._codex_turns.clear()  # first sight of the thread, as after a monitor restart
             self.assertEqual(m.refresh_sessions()[0]['state'], 'thinking')
+            self.assertEqual(m.refresh_sessions()[0]['turn_started'], turn_start)
             with open(chat, 'a') as f:
-                f.write(json.dumps({'timestamp': stamp, 'type': 'event_msg', 'payload': {'type': 'task_complete'}}) + '\n')
-            self.assertEqual(m.refresh_sessions()[0]['state'], 'ready')
+                f.write(json.dumps({'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()), 'type': 'event_msg', 'payload': {'type': 'task_complete'}}) + '\n')
+            finished = m.refresh_sessions()[0]
+            self.assertEqual(finished['state'], 'ready')
+            self.assertIsNone(finished['turn_started'])
+            self.assertGreaterEqual(finished['last_turn'], 10)
+            self.assertFalse(m.music_started(finished, time.time(), {}))
             avatar = m.refresh_sessions()[0]['avatar']
             # A hook under another id for the same rollout takes the detected card over.
             self.codex_event('UserPromptSubmit', sid='codex-a-hook', transcript_path=str(chat))
@@ -732,21 +938,33 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(m.music_started(dict(row, state='ready', turn_started=None), 140, {}))
         self.assertTrue(m.music_started(row, 100, {'music_delay': 0}))
 
-        # The mood follows the provider's usage left, with a margin so estimates near a threshold don't flicker.
-        mood = lambda left, prev=None, reached=False, cfg={}: m.music_mood(left, reached, prev, cfg)
-        self.assertEqual([mood(x) for x in (90, 51, 50, 21, 20, 5)], ['field', 'field', 'battle', 'battle', 'boss', 'boss'])
-        self.assertEqual(mood(0), 'boss')
-        self.assertEqual(mood(60, 'battle', reached=True), 'boss')
-        self.assertEqual(mood(None), 'field')
-        self.assertEqual(mood(None, 'boss'), 'boss')  # no reading keeps the mood
-        self.assertEqual(mood(48, 'field'), 'field')  # just under 50: not yet
-        self.assertEqual(mood(44, 'field'), 'battle')
-        self.assertEqual(mood(53, 'battle'), 'battle')  # just over 50: not yet
-        self.assertEqual(mood(56, 'battle'), 'field')
-        self.assertEqual(mood(18, 'battle'), 'battle')
-        self.assertEqual(mood(14, 'battle'), 'boss')
-        self.assertEqual(mood(30, 'boss', reached=False), 'battle')  # a limit that resets drops straight to its level
-        self.assertEqual(mood(70, cfg={'calm_above': 80, 'boss_below': 40}), 'battle')
+        # The mood follows the pace: projected use at reset, with a margin so estimates don't flicker.
+        mood = lambda proj, prev=None, left=50, reached=False, cfg={}: m.music_mood(proj, left, reached, prev, cfg)
+        self.assertEqual([mood(x) for x in (10, 79, 80, 100, 101, 250)], ['field', 'field', 'battle', 'battle', 'boss', 'boss'])
+        self.assertEqual(mood(5, left=10), 'boss')  # nearly empty is boss whatever the pace
+        self.assertEqual(mood(5, 'field', reached=True), 'boss')
+        self.assertEqual((mood(None), mood(None, 'boss')), ('field', 'boss'))  # no reading keeps the mood
+        self.assertEqual((mood(82, 'field'), mood(86, 'field')), ('field', 'battle'))
+        self.assertEqual((mood(77, 'battle'), mood(74, 'battle')), ('battle', 'field'))
+        self.assertEqual((mood(103, 'battle'), mood(106, 'battle')), ('battle', 'boss'))
+        self.assertEqual(mood(60, cfg={'pace_calm': 50}), 'battle')
+
+        # Projection: used now plus burn rate times the time to reset.
+        now, hour = 1_000_000.0, 3600
+        view = {'left': 80.0, 'resets': now + 2 * hour}  # 20% used, 2h of a 5h window left
+        self.assertAlmostEqual(m.projected_use(view, 5 * hour, now, recent=10 / hour), 40)  # 10%/h for 2h more
+        self.assertAlmostEqual(m.projected_use(view, 5 * hour, now), 20 + 20 / (3 * hour) * 2 * hour)  # average pace
+        early = {'left': 90.0, 'resets': now + 7 * 24 * hour - hour}  # 10% in the first hour of a week
+        self.assertAlmostEqual(m.projected_use(early, 7 * 24 * hour, now), 10 + 10 / (24 * hour) * (7 * 24 - 1) * hour)
+        self.assertEqual(m.projected_use({'left': 30.0, 'resets': None}, hour, now), 70)
+        history = [(now - 1700, 10.0), (now - 900, 14.0), (now - 100, 18.0)]
+        self.assertAlmostEqual(m.recent_rate(history, now), 8 / 1600)
+        self.assertIsNone(m.recent_rate([(now - 100, 10.0), (now, 11.0)], now))  # under five minutes
+        self.assertIsNone(m.recent_rate([(now - 900, 90.0), (now, 2.0)], now))  # a reset in between
+        reading = {'windows': {'primary': {'used': 20.0, 'resets': now + 2 * hour, 'minutes': 300}}}
+        pace = m.codex_pace(reading, m.codex_view(reading, now), now, history)
+        self.assertAlmostEqual(pace['primary'], 20 + 8 / 1600 * 2 * hour)
+        self.assertEqual((m.pace_text(None), m.pace_text(64.4), m.pace_text(5000)), ('', ' · pace 64%', ' · pace 999%'))
         self.assertEqual(m.usage_left({'five_hour': {'left': 70.0}, 'seven_day': {'left': 35.5}, 'x': None}), 35.5)
         self.assertIsNone(m.usage_left({}))
         songs = {'field': ['f'], 'boss': ['b', 'broken']}
@@ -797,7 +1015,7 @@ class MonitorTests(unittest.TestCase):
         for kind in m.CHIMES:
             with wave.open(io.BytesIO(m.chime_wav(kind))) as w:
                 self.assertEqual((w.getnchannels(), w.getsampwidth()), (1, 2))
-                self.assertLess(w.getnframes() / w.getframerate(), 1)
+                self.assertLess(w.getnframes() / w.getframerate(), 2)  # a jingle, not a song
                 sounds[kind] = w.readframes(w.getnframes())
                 self.assertTrue(any(sounds[kind]))
         self.assertEqual(len(set(sounds.values())), len(m.CHIMES))

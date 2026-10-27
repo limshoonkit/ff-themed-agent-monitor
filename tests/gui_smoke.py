@@ -58,7 +58,8 @@ def main():
             if source.suffix in ('.gif', '.json') and source.name != 'music.json':
                 (tifa / source.name).symlink_to(source)
         m.save_config({'enabled': True, 'verbose': True, 'avatars': {'Tifa': str(tifa)},
-                       'themes': {'Tifa': str(song)}, 'music_delay': 0})
+                       'themes': {'Tifa': str(song)}, 'music_delay': 0,
+                       'chimes': ['ready', 'waiting', 'failed']})  # Ready is off by default
         plays = []
         class FakePlayer:
             def __init__(self, command):
@@ -76,6 +77,12 @@ def main():
             'rateLimitResetCredits': {'availableCount': 1}}
         original = tk.Tk
         failures = []
+        scene_cards = {}
+        choose_transition = m.choose_transition
+        def observe_transition(card, avatar, *args):
+            scene_cards[avatar] = card
+            return choose_transition(card, avatar, *args)
+        m.choose_transition = observe_transition
         def labels(root):
             found = []
             def walk(w):
@@ -107,6 +114,14 @@ def main():
                     assert texts.count('CODEX') == 1 and texts.count('CLAUDE') == len(demos), texts
                     for state in ('Working · Bash','Reading · Grep','Thinking','Needs input','Ready','Error'):
                         assert state in texts, texts
+                    waiting = next(w for w in widgets(root) if isinstance(w, tk.Label)
+                                   and w.cget('text') == 'Needs input').master.master
+                    # 72% of the week used with 200000 s of 604800 left: on pace for ~108% by reset.
+                    assert waiting.cget('bg') == m.CARD_BACKDROPS['boss']
+                    assert waiting.cget('highlightbackground') == m.COLORS['waiting']
+                    codex_card = next(w for w in widgets(root) if isinstance(w, tk.Label)
+                                      and w.cget('text') == 'CODEX').master
+                    assert codex_card.cget('bg') == m.CARD_BACKDROPS['boss']
                     assert any(t.startswith('session ') and 'prompts' in t for t in texts), texts
                     assert 'ANTHROPIC · Demo Org · Team (Max 5x) · demo@example.com' in texts, texts
                     assert any(t.startswith('5h · 65% left · resets 2h') for t in texts), texts
@@ -168,7 +183,7 @@ def main():
                     for expected in ('AGENT MONITOR', 'STATUS', 'PRIVACY', '▶ OK'):
                         assert expected in texts, texts
                     assert any(t.startswith('Needs input') for t in texts), texts
-                    assert len([i for i in canvas.find_all() if canvas.type(i) == 'image']) == len(m.LABELS)
+                    assert len([i for i in canvas.find_all() if canvas.type(i) == 'image']) == len(m.LABELS) + len(m.HELP_MARKS)
                     if len(sys.argv) > 2:
                         from PIL import ImageGrab
                         popup.update()
@@ -212,10 +227,39 @@ def main():
                         assert sorted(r[0] for r in db.execute('SELECT avatar FROM sessions')).count('Twin') == 1
                         db.execute('UPDATE sessions SET avatar=? WHERE id=?', ('Rinoa','demo-reading'))
                         db.execute('UPDATE sessions SET avatar=? WHERE id=?', ('Yuna','demo-thinking'))
+                        db.execute('UPDATE sessions SET avatar=? WHERE id=?', ('Lightning','demo-ready'))
                         db.commit()
+                    c = m.config()
+                    c['avatars']['Lightning'] = str(m.ROOT / 'assets/lightning')
+                    m.save_config(c)
+                    event('demo-ready', 'UserPromptSubmit')
+                    event('demo-ready', 'PreToolUse', tool_name='Bash')
                     root.geometry('1040x900+60+60')
                     root.update_idletasks()
-                    root.after(1000, capture_and_remove)
+                    root.after(1000, begin_shift)
+                except BaseException as e:
+                    failures.append(e)
+            def begin_shift():
+                try:
+                    assert scene_cards['Lightning']['key'][1] == 'working'
+                    event('demo-ready', 'PostToolUse')
+                    root.after(800, check_shift)
+                except BaseException as e:
+                    failures.append(e)
+            def check_shift():
+                try:
+                    card = scene_cards['Lightning']
+                    assert card['key'][1] == 'busy_shift', card['key']
+                    assert card['restore_key'][1] == 'thinking'
+                    root.after(1600, finish_shift)
+                except BaseException as e:
+                    failures.append(e)
+            def finish_shift():
+                try:
+                    card = scene_cards['Lightning']
+                    assert card['key'][1] == 'thinking', card['key']
+                    assert not card.get('restore_key')
+                    capture_and_remove()
                 except BaseException as e:
                     failures.append(e)
             def capture_and_remove():

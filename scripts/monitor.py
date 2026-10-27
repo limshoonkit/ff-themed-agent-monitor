@@ -54,6 +54,8 @@ LABELS = {'idle': 'Idle', 'thinking': 'Thinking', 'reading': 'Reading', 'working
 COLORS = {'idle': '#a6b0c3', 'thinking': '#b9a8ff', 'reading': '#7fd4e8', 'working': '#8bb6ff',
           'delegating': '#9fc2ff', 'compacting': '#d6b8ff', 'waiting': '#ffcf70',
           'ready': '#84e0bb', 'background': '#9fd3c7', 'failed': '#ff919b'}
+CARD_BACKDROPS = {'field': '#1e3035', 'battle': '#332d36', 'boss': '#382733'}
+SCENE_INTERVALS = {'working': (8, 14), 'background': (25, 45)}
 BUSY = {'thinking', 'reading', 'working', 'delegating', 'compacting'}
 READ_TOOLS = {'Read', 'Grep', 'Glob', 'LS', 'WebFetch', 'WebSearch', 'NotebookRead', 'ToolSearch',
               'TaskList', 'TaskGet', 'TaskOutput', 'ListMcpResourcesTool', 'ReadMcpResourceTool'}
@@ -70,7 +72,8 @@ COLUMNS = {'id': 'TEXT PRIMARY KEY', 'cwd': 'TEXT', 'pid': 'INTEGER', 'proc_star
            'tool': 'TEXT', 'tools': 'INTEGER DEFAULT 0', 'tool_errors': 'INTEGER DEFAULT 0',
            'prompts': 'INTEGER DEFAULT 0', 'subagents': "TEXT DEFAULT '{}'", 'flash': 'TEXT',
            'flash_until': 'REAL', 'transcript': 'TEXT', 'name': 'TEXT', 'mode': 'TEXT',
-           'jobs': "TEXT DEFAULT '{}'", 'provider': 'TEXT', 'muted': 'INTEGER DEFAULT 0'}
+           'jobs': "TEXT DEFAULT '{}'", 'provider': 'TEXT', 'muted': 'INTEGER DEFAULT 0',
+           'waiters': "TEXT DEFAULT '[]'", 'turn_tools': 'INTEGER DEFAULT 0', 'turn_errors': 'INTEGER DEFAULT 0'}
 USAGE_KEYS = ('input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens')
 # Relative cost of each USAGE_KEYS kind; calibration against real readings absorbs the absolute scale.
 TOKEN_WEIGHTS = (1, 1.25, 0.1, 5)
@@ -127,7 +130,7 @@ def save(db, row):
 
 def blank(sid):
     return dict({c: None for c in COLUMNS}, id=sid, busy=0, tools=0, tool_errors=0, prompts=0,
-                subagents='{}', jobs='{}')
+                subagents='{}', jobs='{}', waiters='[]')
 
 
 def process_info(pid):
@@ -223,7 +226,7 @@ def end_turn(row, now):
         row['last_turn'] = max(0, now - row['turn_started'])
         row['busy'] = (row.get('busy') or 0) + row['last_turn']
         row['turn_started'] = None
-    row['tool'] = None
+    row.update(tool=None, turn_tools=0, turn_errors=0)
 
 
 def apply(row, event, payload, now):
@@ -238,6 +241,7 @@ def apply(row, event, payload, now):
             row['turn_started'] = now
     elif event == 'PreToolUse':
         row['tools'] = (row.get('tools') or 0) + 1
+        row['turn_tools'] = (row.get('turn_tools') or 0) + 1
         name = payload.get('tool_name')
         if not sub and isinstance(name, str):
             row['tool'] = name[:60]
@@ -247,6 +251,7 @@ def apply(row, event, payload, now):
             jobs[use_id[:100]] = now
     elif event == 'PostToolUseFailure' and not payload.get('is_interrupt'):
         row['tool_errors'] = (row.get('tool_errors') or 0) + 1
+        row['turn_errors'] = (row.get('turn_errors') or 0) + 1
         row['flash'], row['flash_until'] = 'failed', now + FLASH_SECONDS['failed']
     elif event == 'SubagentStart' and isinstance(sub, str):
         agents[sub[:80]] = now
@@ -262,6 +267,22 @@ def apply(row, event, payload, now):
     row['subagents'] = json.dumps({k: v for k, v in agents.items() if now - v < 7200})
     row['jobs'] = json.dumps({k: v for k, v in jobs.items() if now - v < JOB_TTL})
     row['state'] = state_for(event, payload, row.get('state') or 'idle')
+    # Who is waiting on the user: '' for the main thread, else a subagent's ID. Only the waiter's own
+    # progress clears its prompt, so a background subagent's tool calls can't hide the parent's (or another
+    # subagent's) pending permission, and a later Stop or idle notice can't either.
+    waiters = set(json.loads(row.get('waiters') or '[]'))
+    who = sub[:80] if isinstance(sub, str) else ''
+    if (event == 'Interrupt' or (event == 'PostToolUseFailure' and payload.get('is_interrupt'))
+            or (event == 'SessionStart' and payload.get('source') != 'compact')):
+        waiters.clear()
+    elif event != 'Notification':
+        waiters.discard(who)
+    if state_for(event, payload) == 'waiting':  # this event itself asks, not a state carried over
+        if event != 'Notification' or not waiters:  # a permission notice repeats a request we may know of
+            waiters.add(who)
+    if waiters:
+        row['state'] = 'waiting'
+    row['waiters'] = json.dumps(sorted(waiters))
     if row['state'] in BUSY and not row.get('turn_started'):
         row['turn_started'] = now  # a prompt, or Claude woken by a finished background job
 
@@ -486,6 +507,14 @@ def refresh_sessions():
             elif old['state'] in BUSY and state != 'thinking' and stamp > old['updated']:
                 row.update(state=state, updated=stamp, source='metadata')  # a missed Stop or Interrupt
                 end_turn(row, stamp)
+            if row['source'] == 'metadata':
+                if state == 'thinking':
+                    # Rollout task_started is also a turn clock when hooks are unavailable.
+                    # Keep it stable across refreshes; a newer task starts a new clock.
+                    if not row.get('turn_started') or (old and stamp > old['updated']):
+                        row['turn_started'] = stamp
+                else:
+                    end_turn(row, stamp)
             if dict(old or {}) != row:
                 save(db, row)
         return [dict(r) for r in db.execute('SELECT * FROM sessions ORDER BY created,id')]
@@ -1111,8 +1140,10 @@ def draw_icon(state, size=18):
 
 def draw_ui_icon(name, size=18):
     """Header glyphs drawn like draw_icon: 'help' (?), 'details' (three lines), 'compact' (one),
-    'sound' / 'muted' (a speaker with waves or a cross), and the usage-bar markers 'clock'
-    (the 5h window) and 'calendar' (the weekly one)."""
+    'sound' / 'muted' (a speaker with waves or a cross), the usage-bar markers 'clock' (the 5h window)
+    and 'calendar' (the weekly one), and the card marks 'long' / 'too long' (a scroll, yellow or red: the
+    context has grown), 'cold' (a snowflake: the prompt cache expired) and 'struggling' (a burst: a turn
+    piling up tool errors or running very long)."""
     from PIL import Image, ImageDraw
     light, dark = '#d6deef', '#101830'
     im = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
@@ -1147,6 +1178,26 @@ def draw_ui_icon(name, size=18):
         for y in (16, 22):
             for x in (8, 14, 20):
                 d.rectangle((x, y, x + 3, y + 3), fill=dark)
+    elif name in ('long', 'too long'):  # a scroll: rolled ends, a parchment body with lines of text
+        body = HEALTH_COLORS[name]
+        d.rectangle((7, 6, 25, 26), fill=body, outline=ICON_BORDER, width=2)
+        for y in (4, 24):
+            d.rounded_rectangle((3, y, 29, y + 5), radius=2, fill='#c9a46a', outline=ICON_BORDER, width=2)
+        for y in (12, 16, 20):
+            d.line((11, y, 21, y), fill=dark, width=2)
+    elif name == 'cold':  # a snowflake: three crossing bars with little branches
+        ice = '#9fd8ff'
+        for a, b in (((16, 2), (16, 30)), ((4, 9), (28, 23)), ((4, 23), (28, 9))):
+            d.line((*a, *b), fill=ICON_BORDER, width=6)
+        for a, b in (((16, 2), (16, 30)), ((4, 9), (28, 23)), ((4, 23), (28, 9))):
+            d.line((*a, *b), fill=ice, width=3)
+        d.ellipse((12, 12, 20, 20), fill=ice, outline=ICON_BORDER)
+    elif name == 'struggling':  # a burst with a "!": trouble in this turn
+        star = [(16 + r * math.cos(math.pi * i / 8 - math.pi / 2), 16 + r * math.sin(math.pi * i / 8 - math.pi / 2))
+                for i, r in zip(range(16), [15, 10] * 8)]
+        d.polygon(star, fill='#ffb070', outline=ICON_BORDER)
+        d.rectangle((14, 6, 17, 17), fill=dark)
+        d.rectangle((14, 20, 17, 23), fill=dark)
     else:  # compact
         d.rectangle((4, 14, 28, 18), fill=light, outline=ICON_BORDER)
     im = im.resize((16, 16), Image.Resampling.NEAREST)
@@ -1163,9 +1214,12 @@ HELP_SECTIONS = (
                      'out what that chat is doing right now. The tag in a card\'s corner says which.'),
     ('STATUS', None),  # filled with the icon legend
     ('USAGE BARS', 'One pair per provider. The clock bar is how much of the 5-hour usage window is left, '
-                   'the calendar bar the weekly one, and when each resets. A ~ means the Anthropic number is '
-                   'estimated since the last check. The OpenAI line also says when the limit is reached and '
-                   'how many free resets you have.'),
+                   'the calendar bar the weekly one, and when each resets. "pace" is how much of the window '
+                   'you will have used by then if you carry on as you are: your last half hour for the 5-hour '
+                   'window, your average so far for the week. A ~ means the Anthropic number is estimated '
+                   'since the last check. The OpenAI line also says when the limit is reached and how many '
+                   'free resets you have.'),
+    ('SESSION HEALTH', 'marks'),  # filled with the mark legend; hover a mark on a card for its numbers
     ('CARD DETAILS', 'Each card shows the chat\'s title, its project and a short session ID. Details add '
                      'session age, active time, context used, tokens in and out, and the model. '
                      'The lines button at the top switches between full details and a compact view.'),
@@ -1173,11 +1227,13 @@ HELP_SECTIONS = (
                 'on this computer. The monitor never sends messages to either and never spends tokens; '
                 'the usage bars check every few minutes: one small request to Anthropic with your Claude '
                 'login, and one to OpenAI that Codex makes itself (the monitor never reads that login).'),
-    ('SOUND', 'A character with music plays it while its chat works, one chat at a time. The usage bars '
-              'set the mood: calm field music while plenty is left, battle music when it runs low, and '
-              'boss music when it is nearly gone. A long task ends with a victory fanfare. Tracks shuffle and pick up where they left off. Chimes mark a chat that '
-              'finished, needs your answer, or failed. The speaker on a card silences that chat; the one '
-              'at the top silences everything.'),
+    ('SOUND', 'A character with music plays it while its chat works, one chat at a time. The pace sets '
+              'the mood: calm field music while you are on course to use under 80% of your allowance, '
+              'battle music when you are on course to use nearly all of it, and boss music when you will '
+              'run out before it resets or have under 10% left. A long task ends with a victory fanfare. '
+              'Tracks shuffle and pick up where they left off. A chime marks a chat that needs your '
+              'answer or failed, at most once a minute each. The speaker on a card silences that chat; '
+              'the one at the top silences everything.'),
     ('TIPS', 'Click the name under an avatar to pick a different character for that chat. '
              'Drag the title bar to move the window.'),
 )
@@ -1237,6 +1293,54 @@ def details(row, usage, now):
     meta = [row['mode']] if row.get('mode') and row['mode'] != 'default' else []
     lines.append(' · '.join(meta + [f'last event {duration(now - (row["updated"] or now))} ago']))
     return lines
+
+
+HEALTH_COLORS = {'fresh': '#84e0bb', 'long': '#ffcf70', 'too long': '#ff919b'}
+HELP_MARKS = (
+    ('long', 'Context getting long (40% full, 150k tokens, or one compaction): /compact at a natural break, '
+             'or start a new chat for the next task.'),
+    ('too long', 'Too long (70% full, 300k tokens, or two compactions): answers suffer. Start a fresh chat; '
+                 'ask the old one for a handoff summary first.'),
+    ('cold', 'Cache gone cold: idle over 5 minutes, so the next message re-reads the whole context at full '
+             'price. Batch follow-ups while it is warm.'),
+    ('struggling', 'Trouble this turn: several tool errors, or a very long run of tool calls. Check whether '
+                   'it is stuck.'))
+HEALTH_ADVICE = {'long': '/compact at a natural break, or a new chat for the next task',
+                 'too long': 'start a fresh chat; ask for a handoff summary first'}
+
+
+def session_health(usage, cfg):
+    """How far a chat's context has grown: ('fresh' | 'long' | 'too long', why), or (None, '') without
+    transcript usage. Answers get worse as the context fills, and each compaction swaps detail for a summary.
+    The token limits apply on 1M windows too, where 30% is already a very large context."""
+    if not usage or not usage.get('window'):
+        return None, ''
+    context, compactions = usage.get('context') or 0, usage.get('compactions') or 0
+    pct = 100 * context / usage['window']
+    why = f'context {tokens(context)} · {pct:.0f}%' + (f' · {compactions} compact' if compactions else '')
+    if pct >= setting(cfg, 'context_bad') or context >= setting(cfg, 'tokens_bad') or compactions >= 2:
+        return 'too long', why
+    if pct >= setting(cfg, 'context_warn') or context >= setting(cfg, 'tokens_warn') or compactions >= 1:
+        return 'long', why
+    return 'fresh', why
+
+
+def session_flags(row, usage, now, cfg):
+    """Best-practice warnings for one chat: a turn that looks stuck (many tool errors, or very long with
+    many tool calls), and an idle chat whose prompt cache has expired, so its next turn re-reads the whole
+    context at full price."""
+    flags = []
+    if row['state'] in BUSY | {'waiting'} and row.get('turn_started'):
+        errors, calls, turn = row.get('turn_errors') or 0, row.get('turn_tools') or 0, now - row['turn_started']
+        if errors >= setting(cfg, 'struggle_errors'):
+            flags.append(f'{errors} tool errors this turn: check on it')
+        elif turn >= setting(cfg, 'long_turn') and calls >= setting(cfg, 'long_turn_tools'):
+            flags.append(f'long turn: {duration(turn)}, {calls} tools')
+    context = (usage or {}).get('context') or 0
+    if (row['state'] not in BUSY and context >= setting(cfg, 'cold_tokens')
+            and now - (row.get('updated') or now) >= setting(cfg, 'cache_ttl')):
+        flags.append(f'cache cold: next turn re-reads {tokens(context)}')
+    return flags
 
 
 def hook_command():
@@ -1354,7 +1458,7 @@ def ui_status():
 
 
 def launch(wait=False):
-    if ui_status() or not config().get('enabled', True):
+    if ui_status() or not config().get('enabled', True) or config().get('headless'):
         return
     DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(DATA / 'monitor.log', 'a') as log:
@@ -1386,15 +1490,15 @@ def gif_for(directory, anim):
     return Path(directory) / 'idle.gif'
 
 
-def scene_paths(directory, anim):
-    """Only execution gets randomized encounters; other states stay unambiguous."""
-    paths = [gif_for(directory, anim)]
+def variant_paths(directory, anim):
+    """Read optional local scenes, accepting only plain GIF basenames."""
+    paths = []
     manifest = Path(directory) / 'variants.json'
-    if anim == 'working' and manifest.exists():
-        names = json.loads(manifest.read_text()).get('working', [])
+    if manifest.exists():
+        names = json.loads(manifest.read_text()).get(anim, [])
         if not isinstance(names, list) or any(not isinstance(n, str) or
                 not re.fullmatch(r'[a-z][a-z0-9-]*', n) for n in names):
-            raise ValueError(f'Invalid encounter list in {manifest}')
+            raise ValueError(f'Invalid {anim} scene list in {manifest}')
         for name in names:
             path = Path(directory) / (name + '.gif')
             if path.exists() and path not in paths:
@@ -1402,16 +1506,51 @@ def scene_paths(directory, anim):
     return paths
 
 
+def scene_paths(directory, anim):
+    """Rotate execution and quiet background scenes; keep alerts and idle predictable."""
+    paths = [gif_for(directory, anim)]
+    if anim in SCENE_INTERVALS:
+        paths.extend(p for p in variant_paths(directory, anim) if p not in paths)
+    return paths
+
+
 def choose_scene(card, avatar, anim, choices, now, rng=random):
-    if anim != 'working':
+    if anim not in SCENE_INTERVALS:
         return avatar, anim, choices[0]
     previous = card.get('encounter')
-    if card.get('encounter_avatar') != avatar or previous not in choices or now >= card.get('encounter_until', 0):
+    if (card.get('encounter_avatar') != avatar or card.get('encounter_anim') != anim
+            or previous not in choices or now >= card.get('encounter_until', 0)):
         options = [c for c in choices if c != previous] or choices
         card['encounter'] = rng.choice(options)
         card['encounter_avatar'] = avatar
-        card['encounter_until'] = now + rng.uniform(8, 14)
+        card['encounter_anim'] = anim
+        card['encounter_until'] = now + rng.uniform(*SCENE_INTERVALS[anim])
     return avatar, anim, card['encounter']
+
+
+def choose_transition(card, avatar, anim, key, shift, now):
+    """Show an optional one-shot shift between busy roles, at most once per 30 seconds."""
+    before = card.get('activity')
+    card['activity'] = (avatar, anim)
+    if anim not in BUSY or (before and before[0] != avatar):
+        card.pop('restore_key', None)
+        return key
+    if card.get('restore_key'):
+        card['restore_key'] = key
+        return card['key']
+    if (shift and before and before[1] in BUSY and before[1] != anim
+            and now >= card.get('shift_after', 0)):
+        card['restore_key'] = key
+        card['shift_after'] = now + 30
+        return shift
+    return key
+
+
+def card_palette(row, moods, cfg):
+    provider = 'openai' if row.get('provider') == 'codex' else 'anthropic'
+    mood = moods.get(provider, 'field')
+    background = CARD_BACKDROPS.get(mood, CARD_BACKDROPS['field']) if cfg.get('mood_backdrops', True) else '#202a3d'
+    return background, COLORS.get(row['state'], COLORS['idle'])
 
 
 def fit_sprite(frame, size=(168, 126)):
@@ -1426,11 +1565,27 @@ def fit_sprite(frame, size=(168, 126)):
 
 THEME_EXTS = ('.ogg', '.opus', '.mp3', '.flac', '.m4a', '.wav')
 THEME_GRACE = 3  # seconds a theme keeps playing through a pause, so back-to-back turns don't restart it
-# Original chiptune chimes (frequency Hz, seconds; 0 Hz is a rest), not sound effects from any game.
-CHIMES = {'ready': ((523.25, .08), (659.25, .08), (783.99, .08), (1046.5, .3)),
-          'waiting': ((987.77, .1), (0, .05), (987.77, .1), (0, .05), (1318.5, .18)),
-          'failed': ((392.0, .12), (329.63, .12), (261.63, .34))}
-CHIME_VERSION = 2
+# Original jingles in a 16-bit RPG style, not tunes from any game. Each note: (start s, Hz, ring s, wave,
+# gain, decay s); 'p25'/'p12' are pulse waves (melody), 'tri' a triangle (bass). Notes ring into each other
+# like a harp, held ones get a little vibrato, and the whole thing goes through an SNES-style echo.
+CHIMES = {
+    'ready': (  # a bright rising G major flourish that settles on a held top note
+        (0.00, 783.99, .30, 'p12', .7, .25), (0.07, 987.77, .30, 'p12', .7, .25),
+        (0.14, 1174.66, .30, 'p12', .7, .25), (0.21, 1567.98, .50, 'p25', .9, .6),
+        (0.00, 196.00, .65, 'tri', 1, .8)),
+    'waiting': (  # a harp-like question: a rising Dmaj9 arpeggio left on its ninth, then a menu-cursor ping
+        (0.00, 587.33, .45, 'p25', .6, .35), (0.07, 739.99, .45, 'p25', .6, .35),
+        (0.14, 880.00, .45, 'p25', .6, .35), (0.21, 1318.51, .50, 'p25', .7, .25),
+        (0.00, 146.83, .55, 'tri', 1, .6),
+        (0.64, 1760.00, .08, 'p12', .8, .3), (0.72, 1318.51, .24, 'p12', .8, .3)),
+    'failed': (  # game over: a slow A minor descent over a low drone, through the leading tone to a held A
+        (0.00, 659.25, .20, 'p25', .7, 1), (0.20, 523.25, .20, 'p25', .7, 1), (0.40, 493.88, .20, 'p25', .7, 1),
+        (0.60, 415.30, .26, 'p25', .7, 1), (0.86, 440.00, .70, 'p25', .8, .9),
+        (0.00, 110.00, .60, 'tri', 1, 2), (0.60, 82.41, .26, 'tri', 1, 2), (0.86, 110.00, .70, 'tri', 1, 1.2)),
+}
+CHIME_DEFAULT = ('waiting', 'failed')  # Ready would chime after every turn; long tasks get a victory fanfare
+CHIME_GAP = 60  # seconds before the same chat chimes the same way again
+CHIME_VERSION = 3
 
 
 def theme_for(name, cfg):
@@ -1456,16 +1611,25 @@ def pick_theme(rows, current, themes):
     return best and best['id']
 
 
-MOODS = ('field', 'battle', 'boss')  # calmer to more urgent, by how much usage is left
+MOODS = ('field', 'battle', 'boss')  # calmer to more urgent, by the pace usage is going at
 MUSIC_KINDS = MOODS + ('victory',)
-MUSIC_DEFAULTS = {'music_delay': 5, 'victory_after': 30, 'victory_seconds': 7, 'calm_above': 50, 'boss_below': 20}
-MOOD_MARGIN = 5  # usage points past a threshold before the mood changes, so estimates can't make it flicker
+MUSIC_DEFAULTS = {'music_delay': 5, 'victory_after': 30, 'victory_seconds': 7,
+                  'pace_calm': 80, 'pace_limit': 100, 'boss_left': 10}
+# Session health: context share and size that make a chat long or too long, when an idle chat's prompt
+# cache has gone cold, and what makes a running turn look stuck.
+HEALTH_DEFAULTS = {'context_warn': 40, 'context_bad': 70, 'tokens_warn': 150_000, 'tokens_bad': 300_000,
+                   'cache_ttl': 300, 'cold_tokens': 50_000, 'struggle_errors': 3,
+                   'long_turn': 1200, 'long_turn_tools': 40}
+SETTINGS = {**MUSIC_DEFAULTS, **HEALTH_DEFAULTS}
+MOOD_MARGIN = 5  # points past a threshold before the mood changes, so estimates can't make it flicker
+WINDOW_SECONDS = {'five_hour': 5 * 3600, 'seven_day': 7 * 86400}
+BURN_SPAN = 1800  # the short window's pace comes from the last half hour of use
 _music_specs = {}  # music.json path -> (mtime, parsed)
 
 
-def music_setting(cfg, key):
-    value = cfg.get(key, MUSIC_DEFAULTS[key])
-    return float(value) if isinstance(value, (int, float)) and value >= 0 else MUSIC_DEFAULTS[key]
+def setting(cfg, key):
+    value = cfg.get(key, SETTINGS[key])
+    return float(value) if isinstance(value, (int, float)) and value >= 0 else SETTINGS[key]
 
 
 def listed_music(directory):
@@ -1506,7 +1670,7 @@ def music_started(row, now, cfg):
     """Whether a chat's music plays yet: it is busy and its turn has run music_delay seconds, so short
     tasks stay silent. Per turn, not per state: Claude flips between thinking and tools every few seconds."""
     return (row['state'] in BUSY and bool(row.get('turn_started'))
-            and now - row['turn_started'] >= music_setting(cfg, 'music_delay'))
+            and now - row['turn_started'] >= setting(cfg, 'music_delay'))
 
 
 def usage_left(views):
@@ -1515,24 +1679,77 @@ def usage_left(views):
     return min(lefts) if lefts else None
 
 
-def music_mood(left, reached, previous, cfg):
-    """The music's mood from a provider's usage: plenty left is field, getting low is battle, critical or
-    reached is boss (a reached limit stops the chat, so it rarely plays). A change waits until usage is
+def projected_use(view, span, now, recent=None):
+    """Percent of a window used by its reset if the current pace holds: used now plus a burn rate (percent
+    per second) times the time left. `recent` is the rate over the last half hour, given for the short
+    window; otherwise the average since the window began, counted over at least a seventh of the window so
+    one busy first hour isn't stretched across a whole week of nights."""
+    used = 100 - view['left']
+    resets = view.get('resets')
+    if not resets or now >= resets:
+        return used
+    if recent is None:
+        recent = used / max(now - (resets - span), span / 7)
+    return used + max(0.0, recent) * (resets - now)
+
+
+def recent_rate(history, now, span=BURN_SPAN):
+    """Percent per second from (time, percent used) readings in the last `span` seconds; None with under
+    five minutes of them, or across a reset."""
+    recent = [(t, u) for t, u in history if now - t <= span]
+    if len(recent) < 2 or recent[-1][0] - recent[0][0] < 300 or recent[-1][1] < recent[0][1]:
+        return None
+    return (recent[-1][1] - recent[0][1]) / (recent[-1][0] - recent[0][0])
+
+
+def music_mood(projected, left, reached, previous, cfg):
+    """The music's mood from a provider's pace: field while the projected use at reset stays under
+    pace_calm (80%), battle on course to use nearly all of it, boss on course to run out before it resets,
+    with under boss_left (10%) left, or once a limit is reached. A change waits until the projection is
     MOOD_MARGIN points past the threshold; without a reading the previous mood stays (field at first)."""
-    if reached or (left is not None and left <= 0):
+    if reached or (left is not None and left <= setting(cfg, 'boss_left')):
         return 'boss'
-    if left is None:
+    if projected is None:
         return previous or 'field'
-    calm, critical = music_setting(cfg, 'calm_above'), music_setting(cfg, 'boss_below')
-    level = lambda x: 0 if x > calm else 1 if x > critical else 2
-    mood = level(left)
+    calm, limit = setting(cfg, 'pace_calm'), setting(cfg, 'pace_limit')
+    level = lambda x: 0 if x < calm else 1 if x <= limit else 2
+    mood = level(projected)
     if previous in MOODS:
         before = MOODS.index(previous)
         if mood > before:
-            mood = max(before, level(left + MOOD_MARGIN))
+            mood = max(before, level(projected - MOOD_MARGIN))
         elif mood < before:
-            mood = min(before, level(left - MOOD_MARGIN))
+            mood = min(before, level(projected + MOOD_MARGIN))
     return MOODS[mood]
+
+
+def anthropic_pace(state, views, now):
+    """Projected use at reset per Anthropic window: the 5h window from this machine's last half hour of
+    transcript tokens at the calibrated rate, the 7d window from its average pace."""
+    out = {}
+    for key, _ in WINDOWS:
+        if not views.get(key):
+            continue
+        rate = (state.get('rates') or {}).get(key) if key == 'five_hour' else None
+        recent = rate * weighted_between(now - BURN_SPAN, now) / BURN_SPAN if rate else None
+        out[key] = projected_use(views[key], WINDOW_SECONDS[key], now, recent)
+    return out
+
+
+def codex_pace(reading, views, now, history=()):
+    """Projected use at reset per Codex window: the short (primary) one from how fast recent readings
+    climbed, when there are enough of them, else from its average pace."""
+    out = {}
+    for key, w in ((reading or {}).get('windows') or {}).items():
+        if views.get(key):
+            recent = recent_rate(history, now) if key == 'primary' else None
+            out[key] = projected_use(views[key], (w.get('minutes') or (300 if key == 'primary' else 10080)) * 60,
+                                     now, recent)
+    return out
+
+
+def pace_text(projected):
+    return '' if projected is None else f' · pace {min(projected, 999):.0f}%'
 
 
 def mood_tracks(songs, mood, bad=()):
@@ -1557,25 +1774,31 @@ def next_track(slot, tracks, rng=random):
 
 
 def chime_wav(kind, rate=22050):
-    """A short chime as 16-bit mono WAV bytes, built from CHIMES: a 25% pulse wave with a two-tap echo,
-    the timbre of 16-bit console menus, playing original note sequences."""
+    """One of the CHIMES jingles as 16-bit mono WAV bytes: pulse-wave melody over a triangle bass, notes
+    ringing into each other, a slight vibrato on held notes, and a two-tap echo."""
     import io
     import wave
-    dry = []
-    for freq, length in CHIMES[kind]:
-        count = int(rate * length)
-        for i in range(count):
-            env = min(1, i / (rate * .005)) * min(1, (count - i) / (rate * .03))  # click-free edges
-            env *= 1 - .35 * i / max(1, count)  # each note decays a little
-            dry.append(((1 if (freq * i / rate) % 1 < .25 else -1) if freq else 0) * env)
-    tail, taps = int(rate * .26), ((int(rate * .11), .35), (int(rate * .22), .15))
-    mixed = dry + [0] * tail
+    waves = {'p25': lambda ph: 1.0 if ph < .25 else -1.0, 'p12': lambda ph: 1.0 if ph < .125 else -1.0,
+             'tri': lambda ph: 4 * abs(ph - .5) - 1}
+    notes = CHIMES[kind]
+    dry = [0.0] * int(rate * max(start + ring for start, _, ring, *_ in notes))
+    for start, freq, ring, shape, gain, decay in notes:
+        offset, count, phase = int(rate * start), int(rate * ring), 0.0
+        for i in range(min(count, len(dry) - offset)):
+            t = i / rate
+            wobble = 1 + .004 * math.sin(2 * math.pi * 5.5 * t) if ring >= .45 and t > .15 else 1
+            phase = (phase + freq * wobble / rate) % 1
+            env = min(1, t / .005) * min(1, (count - i) / (rate * .03)) * math.exp(-t / decay)  # click-free
+            dry[offset + i] += waves[shape](phase) * env * gain
+    taps = ((int(rate * .12), .32), (int(rate * .24), .14))  # SNES-style echo
+    mixed = dry + [0.0] * taps[-1][0]
     for delay, gain in taps:
         for i, v in enumerate(dry):
             mixed[i + delay] += v * gain
+    peak = max(1e-9, max(abs(v) for v in mixed))
     frames = bytearray()
     for v in mixed:
-        frames += int(max(-1, min(1, v * .16)) * 32767).to_bytes(2, 'little', signed=True)
+        frames += int(v / peak * .3 * 32767).to_bytes(2, 'little', signed=True)
     out = io.BytesIO()
     with wave.open(out, 'wb') as w:
         w.setnchannels(1)
@@ -1593,13 +1816,19 @@ def chime_path(kind):
     return path
 
 
-def play(command):
-    """Start a player that dies with the monitor, so a crashed or killed window never leaves a song looping."""
+def child(command, **kwargs):
+    """Start a process that dies with the monitor (PR_SET_PDEATHSIG), so a crashed or killed window never
+    leaves a song looping or an SSH connection open."""
     import ctypes
     import signal
     prctl = ctypes.CDLL(None, use_errno=True).prctl  # looked up before fork: the child only makes the call
-    return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            preexec_fn=lambda: prctl(1, signal.SIGTERM))  # PR_SET_PDEATHSIG
+    kwargs.setdefault('stdout', subprocess.DEVNULL)
+    kwargs.setdefault('stderr', subprocess.DEVNULL)
+    return subprocess.Popen(command, stdin=subprocess.DEVNULL, preexec_fn=lambda: prctl(1, signal.SIGTERM), **kwargs)
+
+
+def play(command):
+    return child(command)
 
 
 def run_ui():
@@ -1629,7 +1858,8 @@ def run_ui():
     title.pack(side='left')
     verbose = [config().get('verbose', True)]
     ui_icons = {name: ImageTk.PhotoImage(draw_ui_icon(name, 18))
-                for name in ('help', 'details', 'compact', 'sound', 'muted', 'clock', 'calendar')}
+                for name in ('help', 'details', 'compact', 'sound', 'muted', 'clock', 'calendar',
+                             'long', 'too long', 'cold', 'struggling')}
     def icon_button(name):
         return tk.Button(header, name=name, image=ui_icons['help'], relief='flat', bd=0, takefocus=0,
                          bg='#202a3d', activebackground='#303e57', padx=3, pady=3,
@@ -1664,7 +1894,7 @@ def run_ui():
             line = tk.Frame(box, bg=meter_bg)
             line.pack(fill='x', pady=(3, 0))
             tk.Label(line, image=ui_icons[glyph], bg=meter_bg).pack(side='left')
-            note = tk.Label(line, bg=meter_bg, fg='#aebbd3', font=('Monospace', 8), anchor='e', width=39)
+            note = tk.Label(line, bg=meter_bg, fg='#aebbd3', font=('Monospace', 8), anchor='e', width=50)
             note.pack(side='right')
             gauge = tk.Canvas(line, height=10, bg='#151b29',
                               highlightthickness=1, highlightbackground=frame_border)
@@ -1684,6 +1914,7 @@ def run_ui():
             for i in range(1, 4):
                 gauge.create_line(width * i / 4, 0, width * i / 4, 10, fill='#202a3d')
     polling, who_cache, openai_cache, codex_polling = [False], [None, 0], [None, 0], [False]
+    codex_history = []  # (fetched, percent used) of the short Codex window, for its recent pace
     def start_codex_poll():
         codex_polling[0] = True
         def work():
@@ -1725,18 +1956,29 @@ def run_ui():
                                              and (active or rolled or not state.get('windows')))):
             start_poll()
         views = limit_view(state, now) if state.get('account') == (acct and acct['email']) else {}
+        pace = anthropic_pace(state, views, now)
         for (key, span), stat in zip(WINDOWS, ('5h', '7d')):
-            draw_meter('anthropic', stat, views.get(key), f'{span} · ' + limit_text(views.get(key), state, now))
-        usage['anthropic'] = (usage_left(views), False)
+            draw_meter('anthropic', stat, views.get(key),
+                       f'{span} · ' + limit_text(views.get(key), state, now) + pace_text(pace.get(key)))
+        usage['anthropic'] = (max(pace.values(), default=None), usage_left(views), False)
         if now - openai_cache[1] > 15:  # Codex also logs a fresh reading with each response
             openai_cache[:] = [codex_limits(now), now]
+            short = ((openai_cache[0] or {}).get('windows') or {}).get('primary')
+            if short and openai_cache[0].get('fetched'):
+                stamp = openai_cache[0]['fetched']
+                if not codex_history or codex_history[-1][0] < stamp:
+                    codex_history.append((stamp, short['used']))
+                del codex_history[:-120]
         reading = openai_cache[0]
         codex_state = load_codex_state() if not codex_polling[0] else {}
         reset_passed = any(w.get('resets') and now > w['resets'] for w in ((reading or {}).get('windows') or {}).values())
         if not codex_polling[0] and now - codex_state.get('checked', 0) >= (60 if reset_passed else POLL_SECONDS):
             start_codex_poll()
         box, who = boxes['openai']
-        usage['openai'] = (usage_left(codex_view(reading, now)), bool((reading or {}).get('reached')))
+        codex_views = codex_view(reading, now)
+        codex_proj = codex_pace(reading, codex_views, now, codex_history)
+        usage['openai'] = (max(codex_proj.values(), default=None), usage_left(codex_views),
+                           bool((reading or {}).get('reached')))
         if not reading or not reading.get('windows'):
             if box.winfo_manager():
                 box.pack_forget()
@@ -1756,7 +1998,8 @@ def run_ui():
         for key, stat in (('primary', '5h'), ('secondary', '7d')):
             w = reading['windows'].get(key) or {}
             span = window_span(w.get('minutes'), stat)
-            draw_meter('openai', stat, views.get(key), f'{span} · ' + limit_text(views.get(key), reading, now))
+            draw_meter('openai', stat, views.get(key),
+                       f'{span} · ' + limit_text(views.get(key), reading, now) + pace_text(codex_proj.get(key)))
     canvas = tk.Canvas(root, bg='#151b29', highlightthickness=0)
     scroll = tk.Scrollbar(root, orient='vertical', command=canvas.yview)
     scroll.pack(side='right', fill='y')
@@ -1771,7 +2014,7 @@ def run_ui():
     cfg = config()
     last_ui_info = [None]
     resized = [True]
-    thumbs, encounters, thumb_h = {}, {}, 54
+    thumbs, encounters, shifts, thumb_h = {}, {}, {}, 54
     def load_avatar(name, directory):
         for anim in ANIMATIONS:
             paths = scene_paths(directory, anim)
@@ -1780,6 +2023,12 @@ def run_ui():
                 with Image.open(path) as im:
                     images[name, anim, path.stem] = [(ImageTk.PhotoImage(fit_sprite(frame)),
                                            max(40, frame.info.get('duration', 120))) for frame in ImageSequence.Iterator(im)]
+        for path in variant_paths(directory, 'busy_shift')[:1]:
+            key = (name, 'busy_shift', path.stem)
+            with Image.open(path) as im:
+                images[key] = [(ImageTk.PhotoImage(fit_sprite(frame)),
+                                max(40, frame.info.get('duration', 120))) for frame in ImageSequence.Iterator(im)]
+            shifts[name] = key
         with Image.open(gif_for(directory, 'idle')) as im:
             thumbs[name] = ImageTk.PhotoImage(fit_sprite(im, (72,54)))
     def reload_avatars():
@@ -1837,7 +2086,7 @@ def run_ui():
         top.overrideredirect(True)  # no OS title bar: the drawn frame is the whole window
         top.attributes('-topmost', True)
         help_window[0] = top
-        w, pad = 470, 24
+        w, pad = 600, 24
         c = tk.Canvas(top, width=w, height=700, bg='#151b29', highlightthickness=0, bd=0)
         c.pack()
         y = pad
@@ -1846,12 +2095,24 @@ def run_ui():
         for heading, body in HELP_SECTIONS:
             c.create_text(pad, y, anchor='nw', text=heading, fill='#ffd98a', font=('Sans', 9, 'bold'))
             y += 19
-            if body is None:  # the state legend, with the same icons the cards use
-                for state, meaning in HELP_STATES.items():
-                    c.create_image(pad + 2, y, anchor='nw', image=state_icons[state])
-                    c.create_text(pad + 32, y + 2, anchor='nw', fill='#f0f4ff', font=('Sans', 9),
+            if body is None:  # the state legend in two columns, with the same icons the cards use
+                states = list(HELP_STATES.items())
+                half = (len(states) + 1) // 2
+                for i, (state, meaning) in enumerate(states):
+                    x, row_y = pad + 2 + (i // half) * (w - 2 * pad) // 2, y + (i % half) * 23
+                    c.create_image(x, row_y, anchor='nw', image=state_icons[state])
+                    c.create_text(x + 30, row_y + 2, anchor='nw', fill='#f0f4ff', font=('Sans', 9),
                                   text=f'{LABELS[state]}  —  {meaning}')
-                    y += 23
+                y += half * 23
+            elif body == 'marks':  # the card marks, with the same icons
+                for kind, meaning in HELP_MARKS:
+                    c.create_image(pad + 2, y, anchor='nw', image=ui_icons[kind])
+                    item = c.create_text(pad + 32, y + 1, anchor='nw', fill='#f0f4ff', font=('Sans', 9),
+                                         text=meaning, width=w - 2 * pad - 32)
+                    y = max(y + 23, c.bbox(item)[3] + 5)
+                c.create_text(pad, y, anchor='nw', fill='#c2cce0', font=('Sans', 8),
+                              text='These appear after a card\'s status; hover one for its numbers.')
+                y += 16
             else:
                 item = c.create_text(pad, y, anchor='nw', text=body, width=w - 2 * pad,
                                      fill='#f0f4ff', font=('Sans', 9))
@@ -1881,8 +2142,12 @@ def run_ui():
             picker[:] = [None, None]
     def choose(sid, name):
         close_picker()
-        with contextlib.closing(connect()) as db, db:
-            db.execute('UPDATE sessions SET avatar=? WHERE id=?', (name, sid))
+        if sid in prefs:  # a remote chat: the choice is kept on this machine
+            prefs[sid]['avatar'] = name
+            save_prefs()
+        else:
+            with contextlib.closing(connect()) as db, db:
+                db.execute('UPDATE sessions SET avatar=? WHERE id=?', (name, sid))
         if sid in cards:
             cards[sid]['row']['avatar'] = name
             cards[sid]['button'].configure(text=name + '  ▾')
@@ -1940,7 +2205,7 @@ def run_ui():
     root.bind('<Button-1>', click_outside, add='+')
     root.bind('<Escape>', close_picker, add='+')
     sound = {'theme': None, 'key': None, 'proc': None, 'since': 0.0, 'seen': 0.0, 'states': {}, 'chimed': 0.0,
-             'hold': 0.0, 'victory': None, 'bad': set(), 'moods': {}}
+             'hold': 0.0, 'victory': None, 'bad': set(), 'moods': {}, 'per_chat': {}}
     usage = {}  # provider -> (lowest percent left, limit reached), kept by update_gauges for the music
     playlists = {}  # (avatar, kind) -> {'track', 'pos', 'bag'}: where each character's music left off
     players = {'chime': next(filter(None, map(shutil.which, ('pw-play', 'aplay', 'ffplay'))), None),
@@ -1956,8 +2221,12 @@ def run_ui():
     master.configure(command=flip_master)
     def flip_mute(sid):
         muted = 0 if cards[sid]['row'].get('muted') else 1
-        with contextlib.closing(connect()) as db, db:
-            db.execute('UPDATE sessions SET muted=? WHERE id=?', (muted, sid))
+        if sid in prefs:
+            prefs[sid]['muted'] = muted
+            save_prefs()
+        else:
+            with contextlib.closing(connect()) as db, db:
+                db.execute('UPDATE sessions SET muted=? WHERE id=?', (muted, sid))
         cards[sid]['row']['muted'] = muted
         audio(cards_rows(), time.time())
     def cards_rows():
@@ -2016,15 +2285,16 @@ def run_ui():
             if not (on and before is not None and before != row['state'] and row['state'] in CHIMES
                     and not row.get('muted') and now - sound['chimed'] > 1.5):
                 continue
+            last = sound['per_chat'].get((row['id'], row['state']), 0)
             sound['chimed'] = now
             songs = music.get(row['avatar'], {})
             wins = [t for t in songs.get('victory', ()) if t not in sound['bad']]
             if (row['state'] == 'ready' and wins and
-                    (row.get('last_turn') or 0) >= music_setting(cfg_now, 'victory_after')):
+                    (row.get('last_turn') or 0) >= setting(cfg_now, 'victory_after')):
                 stop_theme()
                 stop_victory()
                 track = next_track(playlists.setdefault((row['avatar'], 'victory'), {}), wins)
-                seconds = songs.get('victory_seconds') or music_setting(cfg_now, 'victory_seconds')
+                seconds = songs.get('victory_seconds') or setting(cfg_now, 'victory_seconds')
                 sound['hold'] = now + seconds  # no other music over the fanfare
                 try:
                     sound['victory'] = play([players['theme'], '-nodisp', '-autoexit', '-loglevel', 'quiet',
@@ -2032,11 +2302,13 @@ def run_ui():
                                              f'afade=t=out:st={max(0, seconds - 1.5):.1f}:d=1.5', str(track)])
                 except OSError as e:
                     print(f'victory playback failed: {e!r}', file=sys.stderr, flush=True)
-            elif players['chime']:
+            elif (players['chime'] and row['state'] in cfg_now.get('chimes', CHIME_DEFAULT)
+                  and now - last >= CHIME_GAP):
+                sound['per_chat'][row['id'], row['state']] = now
                 chime(row['state'])
         # Background music: one chat at a time, its mood set by how much of its provider's usage is left.
-        for provider, (left, reached) in usage.items():
-            sound['moods'][provider] = music_mood(left, reached, sound['moods'].get(provider), cfg_now)
+        for provider, (projected, left, reached) in usage.items():
+            sound['moods'][provider] = music_mood(projected, left, reached, sound['moods'].get(provider), cfg_now)
         keys = {}
         for row in rows:
             if not (music and music_started(row, now, cfg_now)):
@@ -2066,6 +2338,22 @@ def run_ui():
             playing = sid == sound['theme'] and sound['proc'] is not None and sound['proc'].poll() is None
             card['mute'].configure(image=ui_icons['muted' if muted else 'sound'],
                                    bg='#4a6fa5' if playing else '#303e57')
+    tip = [None]
+    def show_tip(widget):
+        hide_tip()
+        if not getattr(widget, 'tip', None):
+            return
+        top = tk.Toplevel(root)
+        top.overrideredirect(True)
+        top.attributes('-topmost', True)
+        tk.Label(top, text=widget.tip, bg='#0c1440', fg='#f0f4ff', font=('Sans', 8), padx=6, pady=3,
+                 highlightthickness=1, highlightbackground='#d6deef', wraplength=260, justify='left').pack()
+        top.geometry(f'+{widget.winfo_rootx() + 12}+{widget.winfo_rooty() + 22}')
+        tip[0] = top
+    def hide_tip(event=None):
+        if tip[0] is not None:
+            tip[0].destroy()
+            tip[0] = None
     def make_card(sid):
         frame = tk.Frame(board, bg='#202a3d', padx=8, pady=7, width=card_w,
                          highlightthickness=2, highlightbackground=frame_border)
@@ -2089,18 +2377,50 @@ def run_ui():
         icon.pack(side='left', padx=(0, 5))
         status = tk.Label(status_row, bg='#202a3d', font=('Sans', 10, 'bold'))
         status.pack(side='left')
+        marks = {}
+        for kind in ('health', 'cold', 'struggling'):  # shown only when they apply; hover says why
+            marks[kind] = tk.Label(status_row, bg='#202a3d')
+            marks[kind].bind('<Enter>', lambda e, w=marks[kind]: show_tip(w))
+            marks[kind].bind('<Leave>', hide_tip)
         info = tk.Frame(frame, bg='#202a3d')
         bar = tk.Canvas(info, height=6, bg='#151b29', highlightthickness=0, width=card_w - 16)
         text = tk.Label(info, bg='#202a3d', fg='#aebbd3', font=('Monospace', 8), justify='left', anchor='w')
         text.pack(fill='x')
         bar.pack(fill='x', pady=(3, 0))
         return dict(frame=frame, sprite=sprite, tag=tag, button=button, mute=mute, label=label, icon=icon, status=status,
-                    info=info, text=text, bar=bar, key=None, index=0, due=0, shown=None)
+                    info=info, text=text, bar=bar, marks=marks, key=None, index=0, due=0, shown=None,
+                    tint_widgets=(frame, sprite, name_row, label, status_row, icon, status, *marks.values(), info, text))
+    feeds, prefs, feed_info = {}, load_remote_prefs(), [None]
+    def remote_sessions(now):
+        wanted = {r['name']: r['target'] for r in config().get('remotes', [])
+                  if isinstance(r, dict) and r.get('name') and r.get('target')}
+        for name in list(feeds):
+            if wanted.get(name) != feeds[name].target:
+                feeds.pop(name).stop()
+        for name, target in wanted.items():
+            if name not in feeds:
+                feeds[name] = RemoteFeed(name, target)
+        rows = []
+        for feed in feeds.values():
+            rows += remote_rows(feed.name, feed.sessions, feed.offset, feed.online, prefs, list(cfg['avatars']))
+        live = {r['id'] for r in rows}
+        for sid in [k for k in prefs if k not in live and k.split('/', 1)[0] not in feeds]:
+            prefs.pop(sid)  # a removed remote's choices
+        save_prefs()
+        info = {name: feed.status() for name, feed in feeds.items()}
+        if info != feed_info[0]:
+            atomic_json(DATA / 'remotes.json', info)
+            feed_info[0] = info
+        return rows
+    def save_prefs():
+        if prefs != load_remote_prefs():
+            atomic_json(DATA / 'remote_prefs.json', prefs)
     def tick():
         if not config().get('enabled', True):
             root.destroy()
             return
-        rows = refresh_sessions()
+        rows = refresh_sessions() + remote_sessions(time.time())
+        cfg_live = config()
         ids = {r['id'] for r in rows}
         now = time.time()
         changed = resized[0]
@@ -2118,30 +2438,51 @@ def run_ui():
                 changed = True
                 show_details()
             card = cards[sid]
-            usage = session_usage(row)
-            reconcile(row, usage)
+            if row.get('host'):
+                usage = row['remote_usage']  # read and reconciled on the remote
+            else:
+                usage = session_usage(row)
+                reconcile(row, usage)
             card['row'] = row
             if row['avatar'] not in cfg['avatars']:
                 reload_avatars()
             avatar = row['avatar'] if row['avatar'] in cfg['avatars'] else next(iter(cfg['avatars']))
             anim = animation(row, now)
             key = choose_scene(card, avatar, anim, encounters[avatar, anim], now)
+            key = choose_transition(card, avatar, anim, key, shifts.get(avatar), now)
             if card['key'] != key:
                 card.update(key=key, index=0, due=0)
             card['button'].configure(text=avatar + '  ▾')
             # Same layout for every provider: chat name, then project folder (if any) and short ID.
             provider = 'codex' if row.get('provider') == 'codex' else 'claude'
-            card['tag'].configure(text=PROVIDERS[provider].upper(), fg=TAG_COLORS[provider])
+            card['tag'].configure(text=PROVIDERS[provider].upper() + (f' · {row["host"]}' if row.get('host') else ''),
+                                  fg='#8a93a6' if row.get('offline') else TAG_COLORS[provider])
             project = Path(row['cwd']).name if row['cwd'] else ''
             title = row.get('name') or (usage and usage['title'])
-            where = f'{project[:20]} · {sid[:8]}' if project else sid[:8]
+            short = row.get('short') or sid[:8]
+            where = f'{project[:20]} · {short}' if project else short
             if title:
                 title = title if len(title) <= 34 else title[:33].rstrip() + '…'
                 card['label'].configure(text=f'{title}\n{where}')
             else:
-                card['label'].configure(text=f'{project[:24]}\n{sid[:8]}' if project else sid[:8])
-            card['status'].configure(text=status_text(row), fg=COLORS.get(row['state'], '#a6b0c3'))
+                card['label'].configure(text=f'{project[:24]}\n{short}' if project else short)
+            card['status'].configure(text=status_text(row) + (' · offline' if row.get('offline') else ''),
+                                     fg='#8a93a6' if row.get('offline') else COLORS.get(row['state'], '#a6b0c3'))
             card['icon'].configure(image=state_icons.get(row['state'], state_icons['idle']))
+            level, why = session_health(usage, cfg_live)
+            flags = session_flags(row, usage, now, cfg_live)
+            shown_marks = {'health': level in HEALTH_ADVICE and (level, f'{why}: {HEALTH_ADVICE[level]}'),
+                           'cold': next((('cold', f) for f in flags if f.startswith('cache cold')), None),
+                           'struggling': next((('struggling', f) for f in flags if not f.startswith('cache cold')), None)}
+            for kind, mark in card['marks'].items():
+                glyph = shown_marks[kind]
+                if glyph:
+                    mark.configure(image=ui_icons[glyph[0]])
+                    mark.tip = glyph[1]
+                    if not mark.winfo_manager():
+                        mark.pack(side='left', padx=(5, 0))
+                elif mark.winfo_manager():
+                    mark.pack_forget()
             if verbose[0]:
                 card['text'].configure(text='\n'.join(line[:38] for line in details(row, usage, now)))
                 shown = round(min(1, usage['context'] / usage['window']), 3) if usage and usage['window'] else None
@@ -2153,9 +2494,18 @@ def run_ui():
                         width = card_w - 16
                         fill = '#84e0bb' if shown < .5 else '#ffcf70' if shown < .8 else '#ff919b'
                         bar.create_rectangle(0, 0, max(2, width * shown), 6, fill=fill, width=0)
-        audio(rows, now)
-        count.configure(text=f'{len(rows)} chat' + ('' if len(rows) == 1 else 's'))
         update_gauges(rows, now)
+        audio(rows, now)
+        visual_cfg = config()
+        for row in rows:
+            card = cards[row['id']]
+            backdrop, border = card_palette(row, sound['moods'], visual_cfg)
+            if card.get('backdrop') != backdrop:
+                for widget in card['tint_widgets']:
+                    widget.configure(bg=backdrop)
+                card['backdrop'] = backdrop
+            card['frame'].configure(highlightbackground=border)
+        count.configure(text=f'{len(rows)} chat' + ('' if len(rows) == 1 else 's'))
         if changed:
             columns = min(max(1, len(rows)), 4, max(1, (root.winfo_screenwidth()-80)//(card_w+16)))
             width = max(360, columns*(card_w+16)+38)
@@ -2178,6 +2528,9 @@ def run_ui():
         for card in cards.values():
             if card['key'] and now >= card['due']:
                 frames = images[card['key']]
+                if card.get('restore_key') and card['index'] >= len(frames):
+                    card.update(key=card.pop('restore_key'), index=0)
+                    frames = images[card['key']]
                 image, duration = frames[card['index'] % len(frames)]
                 card['sprite'].configure(image=image)
                 card['index'] += 1
@@ -2201,14 +2554,185 @@ def run_ui():
     finally:
         stop_theme()
         stop_victory()
+        for feed in feeds.values():
+            feed.stop()
+        (DATA / 'remotes.json').unlink(missing_ok=True)
         (DATA / 'ui.json').unlink(missing_ok=True)
         lock.close()
+
+
+SNAPSHOT_VERSION = 1
+SNAPSHOT_EVERY = 3  # seconds between a remote's snapshots
+REMOTE_SCRIPT = '~/.agent-monitor/monitor.py'  # where remote-add copies this script on a remote host
+SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=accept-new']
+SSH = ['ssh'] + SSH_OPTIONS + ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2']
+# Never prompts: keys, ssh-agent and ~/.ssh/config only; a new host key is accepted once, a changed one refused.
+REMOTE_TIMES = ('created', 'started', 'updated', 'turn_started', 'flash_until')
+
+
+def snapshot():
+    """This machine's sessions with their transcript usage: what a remote host sends the window over SSH."""
+    sessions = []
+    for row in refresh_sessions():
+        usage = session_usage(row)
+        reconcile(row, usage)
+        sessions.append(dict(row, usage=usage and dict(usage, finished=len(usage['finished']))))
+    return {'version': SNAPSHOT_VERSION, 'now': time.time(), 'sessions': sessions}
+
+
+def watch_snapshots(every=SNAPSHOT_EVERY):
+    """Print a snapshot line whenever the sessions change (and every 30 s regardless) until the reader goes.
+    One long-lived process keeps the transcript readers warm instead of re-reading every file per poll."""
+    last, sent = None, 0.0
+    try:
+        while os.getppid() != 1:  # sshd went away
+            snap = snapshot()
+            body = json.dumps(snap['sessions'], sort_keys=True)
+            if body != last or time.time() - sent > 30:
+                print(json.dumps(snap, separators=(',', ':')), flush=True)
+                last, sent = body, time.time()
+            time.sleep(every)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+def remote_rows(host, sessions, offset, online, prefs, names):
+    """A remote's snapshot sessions as local card rows: IDs namespaced by host, times moved onto this clock,
+    and the avatar and mute chosen on this machine (new chats rotate through the local catalog)."""
+    rows = []
+    for session in sessions:
+        row = dict(session, id=f'{host}/{session["id"]}', host=host, short=str(session['id'])[:8],
+                   offline=not online, remote_usage=session.get('usage'))
+        for key in REMOTE_TIMES:
+            if isinstance(row.get(key), (int, float)):
+                row[key] += offset
+        pref = prefs.setdefault(row['id'], {})
+        if pref.get('avatar') not in names and names:
+            pref['avatar'] = names[sum(1 for p in prefs.values() if p.get('avatar')) % len(names)]
+        row.update(avatar=pref.get('avatar') or row.get('avatar'), muted=int(bool(pref.get('muted'))))
+        rows.append(row)
+    return rows
+
+
+def load_remote_prefs():
+    try:
+        prefs = json.loads((DATA / 'remote_prefs.json').read_text())
+        return prefs if isinstance(prefs, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+class RemoteFeed:
+    """One remote host's sessions over a single long-lived SSH connection running `snapshot watch` there.
+    A dropped connection retries with backoff (5 s, doubling to a minute); the host's last sessions stay
+    on screen, marked offline, until it answers again."""
+    def __init__(self, name, target):
+        self.name, self.target = name, target
+        self.sessions, self.offset, self.online, self.error, self.seen = [], 0.0, False, None, 0.0
+        self.proc, self.stopped = None, False
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def command(self):
+        return SSH + [check_ssh_target(self.target), f'python3 {REMOTE_SCRIPT} snapshot watch']
+
+    def run(self):
+        delay = 5
+        while not self.stopped:
+            began, log = time.time(), DATA / f'remote-{self.name}.log'
+            try:
+                with open(log, 'w') as errors:
+                    self.proc = child(self.command(), stdout=subprocess.PIPE, stderr=errors, text=True)
+                    for line in self.proc.stdout:
+                        snap = json.loads(line)
+                        if snap.get('version') != SNAPSHOT_VERSION:
+                            raise ValueError('its monitor is a different version: rerun remote-add')
+                        self.offset = time.time() - snap['now']  # remote clock to this one
+                        self.sessions, self.online, self.error, self.seen = snap['sessions'], True, None, time.time()
+                        delay = 5
+                    self.proc.wait()
+                lines = log.read_text().strip().splitlines()
+                self.error = lines[-1][:120] if lines else f'disconnected (exit {self.proc.returncode})'
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                self.error = str(e)[:120]
+                if self.proc and self.proc.poll() is None:
+                    self.proc.terminate()
+            self.online = False
+            if time.time() - began > 60:
+                delay = 5  # a long-lived connection that dropped retries soon
+            for _ in range(int(delay * 10)):
+                if self.stopped:
+                    return
+                time.sleep(.1)
+            delay = min(60, delay * 2)
+
+    def stop(self):
+        self.stopped = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def status(self):
+        return {'target': self.target, 'online': self.online, 'error': self.error, 'sessions': len(self.sessions),
+                'last_seen': self.seen or None}
+
+
+def remote_status():
+    """Each registered remote and, while the window runs, its connection state."""
+    try:
+        live = json.loads((DATA / 'remotes.json').read_text())
+    except (OSError, ValueError):
+        live = {}
+    return {r['name']: live.get(r['name'], {'target': r['target'], 'online': None, 'error': 'window not running'})
+            for r in config().get('remotes', []) if isinstance(r, dict) and r.get('name')}
+
+
+def check_ssh_target(target):
+    if not target or target.startswith('-') or any(c.isspace() for c in target):
+        raise ValueError(f'{target!r} is not an SSH target or ~/.ssh/config alias')
+    return target
+
+
+def remote_add(target, name=None):
+    """Copy this script to a host, install its hooks there in headless mode, and register the host."""
+    target, name = check_ssh_target(target), name or target
+    if not re.fullmatch(r'[\w.@-]{1,40}', name):
+        raise ValueError(f'{name!r}: use up to 40 letters, digits, ".", "-", "_" or "@" for a remote name')
+    run = lambda command, **kw: subprocess.run(SSH + [target, command], text=True, capture_output=True, timeout=60, **kw)
+    found = run('mkdir -p ~/.agent-monitor && python3 -c "import sys; print(sys.version_info >= (3, 9))"')
+    if found.returncode != 0:
+        raise RuntimeError(f'ssh {target} failed: {(found.stderr.strip().splitlines() or ["no error output"])[-1]}')
+    if found.stdout.strip() != 'True':
+        raise RuntimeError(f'{target} needs Python 3.9 or newer as python3')
+    copied = subprocess.run(['scp', '-q'] + SSH_OPTIONS + [str(Path(__file__).resolve()),
+                             f'{target}:.agent-monitor/monitor.py'], text=True, capture_output=True, timeout=60)
+    if copied.returncode != 0:
+        raise RuntimeError(f'copy to {target} failed: {copied.stderr.strip()}')
+    setup = run(f'python3 {REMOTE_SCRIPT} remote-setup')
+    if setup.returncode != 0:
+        raise RuntimeError(f'setup on {target} failed: {setup.stderr.strip() or setup.stdout.strip()}')
+    c = config()
+    c['remotes'] = [r for r in c.get('remotes', []) if r.get('name') != name] + [{'name': name, 'target': target}]
+    save_config(c)
+    return setup.stdout.strip()
+
+
+def remote_setup():
+    """Run on a remote host by remote-add: record hook events there, never open a window."""
+    c = config(); c['headless'] = True; save_config(c)
+    done = []
+    if (Path.home() / '.claude').is_dir() or shutil.which('claude'):
+        install_hooks()
+        done.append('Claude Code')
+    if CODEX.is_dir():
+        install_codex_hooks()
+        done.append('Codex (approve once in Codex: /hooks)')
+    print('Hooks installed for ' + (', '.join(done) if done else 'nothing yet: install Claude Code or Codex, then rerun remote-add'))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['start','stop','status','run','hook','install-hooks','uninstall-hooks',
-                                            'install-codex-hooks','uninstall-codex-hooks','add-avatar','set-theme'])
+                                            'install-codex-hooks','uninstall-codex-hooks','add-avatar','set-theme',
+                                            'snapshot','remote-add','remote-remove','remote-setup'])
     parser.add_argument('extra', nargs='*')
     args = parser.parse_args()
     if args.command == 'hook':
@@ -2226,6 +2750,38 @@ def main():
             print('{}')
     elif args.command == 'run':
         run_ui()
+    elif args.command == 'snapshot':
+        if args.extra == ['watch']:
+            watch_snapshots()
+        else:
+            print(json.dumps(snapshot(), indent=2))
+    elif args.command == 'remote-setup':
+        remote_setup()
+    elif args.command == 'remote-add':
+        if len(args.extra) not in (1, 2):
+            parser.error('remote-add requires TARGET [NAME]: an SSH target or ~/.ssh/config alias that works without a password')
+        try:
+            print(remote_add(*args.extra))
+        except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            parser.exit(1, f'remote-add: {e}\n')
+        print(f'Added {args.extra[-1]}. Its chats appear in the window within a few seconds.')
+    elif args.command == 'remote-remove':
+        if len(args.extra) != 1:
+            parser.error('remote-remove requires NAME')
+        c = config()
+        entry = next((r for r in c.get('remotes', []) if r.get('name') == args.extra[0]), None)
+        if not entry:
+            parser.error(f'No remote named {args.extra[0]}; registered: {", ".join(r["name"] for r in c.get("remotes", [])) or "none"}')
+        try:
+            out = subprocess.run(SSH + [check_ssh_target(entry['target']),
+                                        f'python3 {REMOTE_SCRIPT} uninstall-hooks; python3 {REMOTE_SCRIPT} uninstall-codex-hooks'],
+                                 text=True, capture_output=True, timeout=60)
+            note = 'its hooks were removed' if out.returncode == 0 else f'its hooks could not be removed ({out.stderr.strip() or "unreachable"})'
+        except (OSError, subprocess.TimeoutExpired) as e:
+            note = f'its hooks could not be removed ({e})'
+        c['remotes'] = [r for r in c['remotes'] if r is not entry]
+        save_config(c)
+        print(f'Removed {entry["name"]}; {note}. Files in ~/.agent-monitor on it were left in place.')
     elif args.command == 'start':
         c = config(); c['enabled'] = True; save_config(c)
         launch(wait=True)
@@ -2248,19 +2804,26 @@ def main():
             reconcile(row, reader)
             if reader:
                 reader = dict(reader, finished=len(reader['finished']))
-            row.update(label=status_text(row), usage=reader, details=details(row, reader, now))
+            level, why = session_health(reader, config())
+            row.update(label=status_text(row), usage=reader, details=details(row, reader, now),
+                       health=level and {'level': level, 'why': why, 'advice': HEALTH_ADVICE.get(level)},
+                       flags=session_flags(row, reader, now, config()))
         state = load_limits()
         if now - state.get('checked', 0) >= POLL_SECONDS or state.get('account') != (account() or {}).get('email'):
             state = poll_limits(now)
         views = limit_view(state, now)
-        moods = {'anthropic': music_mood(usage_left(views), False, None, config())}
+        pace = {'anthropic': anthropic_pace(state, views, now)}
+        moods = {'anthropic': music_mood(max(pace['anthropic'].values(), default=None), usage_left(views), False, None, config())}
         limits = {span: limit_text(views.get(key), state, now) for key, span in WINDOWS}
+        limits.update({f'{span}_pace': round(pace['anthropic'][key], 1) for key, span in WINDOWS if key in pace['anthropic']})
         limits.update(source=state.get('source'), error=state.get('error'), other=state.get('extra'),
                       calibrated=sorted(state.get('rates') or {}))
         if now - load_codex_state().get('checked', 0) >= POLL_SECONDS:
             poll_codex_limits(now)
         openai = codex_limits(now)
-        moods['openai'] = music_mood(usage_left(codex_view(openai, now)), bool((openai or {}).get('reached')), None, config())
+        codex_proj = codex_pace(openai, codex_view(openai, now), now)
+        moods['openai'] = music_mood(max(codex_proj.values(), default=None), usage_left(codex_view(openai, now)),
+                                     bool((openai or {}).get('reached')), None, config())
         if openai and openai.get('windows'):
             views = codex_view(openai, now)
             openai = dict({window_span(w['minutes'], key): limit_text(views.get(key), openai, now)
@@ -2271,11 +2834,12 @@ def main():
         music = {n: music_for(n, cfg) for n in cfg['avatars']}
         sound = {'on': cfg.get('sound', True),
                  'music': {n: {k: [f.name for f in v[k]] for k in MUSIC_KINDS} for n, v in music.items()},
-                 'settings': {k: music_setting(cfg, k) for k in MUSIC_DEFAULTS}, 'moods': moods,
+                 'settings': {k: setting(cfg, k) for k in SETTINGS}, 'moods': moods,
                  'theme_player': shutil.which('ffplay'), 'muted_sessions': [r['id'] for r in sessions if r.get('muted')]}
         print(json.dumps({'running': bool(ui_status()), 'enabled': config().get('enabled', True), 'sound': sound,
                           'account': account(), 'limits': limits, 'openai_limits': openai,
-                          'avatars': list(config()['avatars']), 'sessions': sessions}, indent=2))
+                          'avatars': list(config()['avatars']), 'sessions': sessions,
+                          'remotes': remote_status()}, indent=2))
     elif args.command in ('install-hooks', 'uninstall-hooks'):
         install_hooks(args.command == 'uninstall-hooks')
     elif args.command in ('install-codex-hooks', 'uninstall-codex-hooks'):

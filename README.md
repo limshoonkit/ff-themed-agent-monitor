@@ -31,6 +31,31 @@ python3 scripts/monitor.py status
 
 `install-hooks` and `install-codex-hooks` back up and merge the respective existing settings. `stop` closes the monitor. `uninstall-hooks` and `uninstall-codex-hooks` remove only this monitor's hook entries. The `SKILL.md` file describes the full command set and state mapping.
 
+## Session health
+
+Small marks after a card's status show when a chat needs attention; nothing shows while it's healthy. Hover a mark for its numbers. The `?` help panel lists them all:
+
+| Mark | Means | What to do |
+|---|---|---|
+| yellow scroll | context getting long: 40% full, 150k tokens, or one compaction | `/compact` at a natural break, or a new chat for the next task |
+| red scroll | too long: 70% full, 300k tokens, or two compactions | start a fresh chat; ask the old one for a handoff summary first |
+| snowflake | idle over 5 minutes, so the prompt cache expired | the next message re-reads the whole context at full price; batch follow-ups while it's warm |
+| burst | several tool errors this turn, or a very long run of tool calls | check whether the agent is stuck |
+
+Only Needs input and Error chime by default, at most once a minute per chat. Add `"ready"` to `"chimes"` in `config.json` for a chime after every turn, or set `"chimes": []` for none. The thresholds are adjustable in `config.json` too; see SKILL.md.
+
+## Remote machines
+
+Chats running on another machine, for example Claude Code in a VS Code Remote-SSH window, can appear in this window too. SSH to the machine must already work without a password (a key, `ssh-agent`, or an alias in `~/.ssh/config`), and it needs Python 3.9 or newer.
+
+```bash
+python3 scripts/monitor.py remote-add devbox            # an SSH target or ~/.ssh/config alias
+python3 scripts/monitor.py remote-add me@10.0.0.5 gpu   # with a display name
+python3 scripts/monitor.py remote-remove gpu
+```
+
+`remote-add` copies `monitor.py` to `~/.agent-monitor/` on the machine and installs its hooks there; that copy only records events and never opens a window. The window keeps one SSH connection per machine and shows its chats as normal cards tagged with the machine's name, such as `CLAUDE · devbox`. If the connection drops, the cards stay, greyed and marked offline, until it reconnects. Run `remote-add` again after updating this repository to update the remote copy.
+
 ## Avatars
 
 Copy your GIFs into `assets/<name>/` or register a separate local folder:
@@ -39,7 +64,9 @@ Copy your GIFs into `assets/<name>/` or register a separate local folder:
 python3 scripts/monitor.py add-avatar "My Avatar" /absolute/path/to/gifs
 ```
 
-Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. The local set is Tifa, Rinoa, Yuna and Lightning.
+Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes (8–14 seconds per scene) and quiet background scenes (25–45 seconds). Idle and approval/error poses stay consistent. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. The local set is Tifa, Rinoa, Yuna and Lightning.
+
+Local background variants include Tifa at a Seventh Heaven drinks counter, Rinoa playing fetch with Angelo, and Yuna embracing Valefor. Lightning's optional `busy_shift` scene plays once when her busy role changes, at most every 30 seconds, then returns to the activity animation. Input requests and errors interrupt it immediately.
 
 ## Music
 
@@ -55,19 +82,19 @@ Music files go in the character's folder and are ignored by Git. A `music.json` 
 }
 ```
 
-The usage bars set the mood, using the chat's own provider and its lowest window:
+The music follows your pace: how much of each usage window you'll have used by its reset if you carry on as you are. The bars show it as `pace N%`. The 5-hour window uses your last half hour; the weekly window uses your average since it began. The worse window decides, for the chat's own provider:
 
-| Usage left | Music |
+| Projected use at reset | Music |
 |---|---|
-| above 50% | field |
-| 20–50% | battle |
-| below 20% | boss |
+| under 80% | field |
+| 80–100% | battle |
+| over 100%, or under 10% left | boss |
 
-A mood only changes once usage is 5 points past a threshold, so estimated readings near 50% or 20% don't make the music flip back and forth. A character with no tracks for a mood plays the next calmer one.
+A mood only changes once the projection is 5 points past a threshold, so estimated readings don't make the music flip back and forth. A character with no tracks for a mood plays the next calmer one.
 
 Music starts once a task has run for 5 seconds, so quick replies stay silent. Music follows the whole turn rather than each state, because a chat switches between thinking and tool use every few seconds. When a task of 30 seconds or more finishes, the victory track plays its opening seconds and fades out; shorter tasks get a chime. Each list shuffles without repeating a track twice in a row. Every track also resumes where it stopped, so a run of short tasks moves through a long track instead of replaying its intro.
 
-`calm_above`, `boss_below`, `music_delay`, `victory_after`, `victory_seconds` and `theme_volume` in `config.json` change the thresholds, timings and volume. `python3 scripts/monitor.py status` shows the playlists each character resolved.
+`pace_calm`, `pace_limit`, `boss_left`, `music_delay`, `victory_after`, `victory_seconds` and `theme_volume` in `config.json` change the thresholds, timings and volume. `python3 scripts/monitor.py status` shows the playlists each character resolved.
 
 ## Development
 
