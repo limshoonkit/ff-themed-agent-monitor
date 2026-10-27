@@ -1173,9 +1173,11 @@ HELP_SECTIONS = (
                 'on this computer. The monitor never sends messages to either and never spends tokens; '
                 'the usage bars check every few minutes: one small request to Anthropic with your Claude '
                 'login, and one to OpenAI that Codex makes itself (the monitor never reads that login).'),
-    ('SOUND', 'A character with a theme file plays it while its chat is working, one chat at a time. '
-              'Chimes mark a chat that finished, needs your answer, or failed. The speaker on a card '
-              'silences that chat; the one at the top silences everything.'),
+    ('SOUND', 'A character with music plays it while its chat works, one chat at a time: calm music once '
+              'a task has run a few seconds, battle music for long tasks, and a victory fanfare when a '
+              'long task finishes. Tracks shuffle and pick up where they left off. Chimes mark a chat that '
+              'finished, needs your answer, or failed. The speaker on a card silences that chat; the one '
+              'at the top silences everything.'),
     ('TIPS', 'Click the name under an avatar to pick a different character for that chat. '
              'Drag the title bar to move the window.'),
 )
@@ -1428,7 +1430,7 @@ THEME_GRACE = 3  # seconds a theme keeps playing through a pause, so back-to-bac
 CHIMES = {'ready': ((523.25, .08), (659.25, .08), (783.99, .08), (1046.5, .3)),
           'waiting': ((987.77, .1), (0, .05), (987.77, .1), (0, .05), (1318.5, .18)),
           'failed': ((392.0, .12), (329.63, .12), (261.63, .34))}
-CHIME_VERSION = 1
+CHIME_VERSION = 2
 
 
 def theme_for(name, cfg):
@@ -1454,17 +1456,94 @@ def pick_theme(rows, current, themes):
     return best and best['id']
 
 
+MUSIC_KINDS = ('field', 'battle', 'victory')
+MUSIC_DEFAULTS = {'music_delay': 5, 'battle_after': 30, 'victory_seconds': 7}
+_music_specs = {}  # music.json path -> (mtime, parsed)
+
+
+def music_setting(cfg, key):
+    value = cfg.get(key, MUSIC_DEFAULTS[key])
+    return float(value) if isinstance(value, (int, float)) and value >= 0 else MUSIC_DEFAULTS[key]
+
+
+def listed_music(directory):
+    """{'field': [...], 'battle': [...], 'victory': [...]} of existing files named in the folder's music.json,
+    plus its optional 'victory_seconds'."""
+    found = {kind: [] for kind in MUSIC_KINDS}
+    path = Path(directory) / 'music.json' if directory else None
+    try:
+        stamp = path.stat().st_mtime
+        if _music_specs.get(path, (None,))[0] != stamp:
+            _music_specs[path] = (stamp, json.loads(path.read_text()))
+        spec = _music_specs[path][1]
+    except (AttributeError, OSError, ValueError):
+        spec = {}
+    if isinstance(spec, dict):
+        for kind in MUSIC_KINDS:
+            names = spec.get(kind)
+            names = [names] if isinstance(names, str) else names if isinstance(names, list) else []
+            files = (Path(directory) / n for n in names if isinstance(n, str))
+            found[kind] = [f for f in files if f.suffix.lower() in THEME_EXTS and f.is_file()]
+        seconds = spec.get('victory_seconds')
+        if isinstance(seconds, (int, float)) and seconds > 0:
+            found['victory_seconds'] = float(seconds)
+    return found
+
+
+def music_for(name, cfg):
+    """A character's playlists from its music.json; without a field list there, the set-theme file
+    (else theme.<ext>) is the field music."""
+    found = listed_music((cfg.get('avatars') or {}).get(name))
+    if not found['field']:
+        theme = theme_for(name, cfg)
+        found['field'] = [theme] if theme else []
+    return found
+
+
+def music_mode(row, now, cfg):
+    """'field' or 'battle' for a busy chat, None before its music starts. Chosen per turn, not per state:
+    Claude flips between thinking and tools every few seconds, so a turn gets field music once it has run
+    music_delay seconds (short tasks stay silent) and becomes a battle after battle_after, until it ends."""
+    if row['state'] not in BUSY or not row.get('turn_started'):
+        return None
+    age = now - row['turn_started']
+    if age < music_setting(cfg, 'music_delay'):
+        return None
+    return 'battle' if age >= music_setting(cfg, 'battle_after') else 'field'
+
+
+def next_track(slot, tracks, rng=random):
+    """Shuffle-bag order: every track once per round, never the same one twice in a row across rounds."""
+    bag = [t for t in slot.get('bag') or () if t in tracks]
+    if not bag:
+        bag = list(tracks)
+        rng.shuffle(bag)
+        if len(bag) > 1 and bag[0] == slot.get('track'):
+            bag.append(bag.pop(0))
+    slot.update(track=bag[0], bag=bag[1:], pos=0.0)
+    return bag[0]
+
+
 def chime_wav(kind, rate=22050):
-    """A short square-wave chime as 16-bit mono WAV bytes, built from CHIMES."""
+    """A short chime as 16-bit mono WAV bytes, built from CHIMES: a 25% pulse wave with a two-tap echo,
+    the timbre of 16-bit console menus, playing original note sequences."""
     import io
     import wave
-    frames = bytearray()
+    dry = []
     for freq, length in CHIMES[kind]:
         count = int(rate * length)
         for i in range(count):
             env = min(1, i / (rate * .005)) * min(1, (count - i) / (rate * .03))  # click-free edges
-            wave_ = (1 if math.sin(2 * math.pi * freq * i / rate) >= 0 else -1) if freq else 0
-            frames += int(wave_ * env * 0.18 * 32767).to_bytes(2, 'little', signed=True)
+            env *= 1 - .35 * i / max(1, count)  # each note decays a little
+            dry.append(((1 if (freq * i / rate) % 1 < .25 else -1) if freq else 0) * env)
+    tail, taps = int(rate * .26), ((int(rate * .11), .35), (int(rate * .22), .15))
+    mixed = dry + [0] * tail
+    for delay, gain in taps:
+        for i, v in enumerate(dry):
+            mixed[i + delay] += v * gain
+    frames = bytearray()
+    for v in mixed:
+        frames += int(max(-1, min(1, v * .16)) * 32767).to_bytes(2, 'little', signed=True)
     out = io.BytesIO()
     with wave.open(out, 'wb') as w:
         w.setnchannels(1)
@@ -1826,7 +1905,9 @@ def run_ui():
             close_picker()
     root.bind('<Button-1>', click_outside, add='+')
     root.bind('<Escape>', close_picker, add='+')
-    sound = {'theme': None, 'path': None, 'proc': None, 'seen': 0.0, 'states': {}, 'chimed': 0.0}
+    sound = {'theme': None, 'key': None, 'proc': None, 'since': 0.0, 'seen': 0.0, 'states': {}, 'chimed': 0.0,
+             'hold': 0.0, 'victory': None, 'bad': set()}
+    playlists = {}  # (avatar, kind) -> {'track', 'pos', 'bag'}: where each character's music left off
     players = {'chime': next(filter(None, map(shutil.which, ('pw-play', 'aplay', 'ffplay'))), None),
                'theme': shutil.which('ffplay')}
     def sound_on():
@@ -1849,43 +1930,98 @@ def run_ui():
     def stop_theme():
         if sound['proc'] and sound['proc'].poll() is None:
             sound['proc'].terminate()
-        sound.update(theme=None, path=None, proc=None)
+            slot = playlists.get(sound['key'])
+            if slot:  # resume here next time, so short turns walk through a long track instead of its intro
+                slot['pos'] += time.time() - sound['since']
+        sound.update(theme=None, key=None, proc=None)
+    def stop_victory():
+        if sound['victory'] and sound['victory'].poll() is None:
+            sound['victory'].terminate()
+        sound.update(victory=None, hold=0.0)
+    def start_music(sid, key, tracks, volume, now):
+        slot = playlists.setdefault(key, {'track': None, 'pos': 0.0, 'bag': []})
+        if slot['track'] not in tracks:
+            next_track(slot, tracks)
+        sound.update(theme=sid, key=key, seen=now, since=now)
+        command = [players['theme'], '-nodisp', '-autoexit', '-loglevel', 'quiet', '-volume', str(volume)]
+        if slot['pos'] > 0:
+            command += ['-ss', f'{slot["pos"]:.1f}', '-af', 'asetpts=PTS-STARTPTS,afade=t=in:d=1.5']
+        try:
+            sound['proc'] = play(command + [str(slot['track'])])
+        except OSError as e:
+            print(f'theme playback failed: {e!r}', file=sys.stderr, flush=True)
+    def chime(kind):
+        try:
+            command = [players['chime'], str(chime_path(kind))]
+            if command[0].endswith('ffplay'):
+                command[1:1] = ['-nodisp', '-autoexit', '-loglevel', 'quiet']
+            play(command)
+        except OSError as e:
+            print(f'chime failed: {e!r}', file=sys.stderr, flush=True)
     def audio(rows, now):
         on = sound_on()
         cfg_now = config()
-        themes = {r['id']: theme_for(r['avatar'], cfg_now) for r in rows} if on and players['theme'] else {}
-        target = pick_theme(rows, sound['theme'], themes) if on else None
-        current = next((r for r in rows if r['id'] == sound['theme']), None)
-        if target == sound['theme'] and target:
-            sound['seen'] = now
-        elif target is None and current and on and not current.get('muted') and now - sound['seen'] < THEME_GRACE:
-            target = sound['theme']  # a short pause between turns
-        path = themes.get(target)
-        if (target, path) != (sound['theme'], sound['path']):
-            stop_theme()
-            if target and path:
-                # Started once per chat and file: a file ffplay cannot play is not retried every tick.
-                volume = max(0, min(100, int(cfg_now.get('theme_volume', 60))))
-                sound.update(theme=target, path=path, seen=now)
-                try:
-                    sound['proc'] = play([players['theme'], '-nodisp', '-autoexit', '-loop', '0',
-                                          '-loglevel', 'quiet', '-volume', str(volume), str(path)])
-                except OSError as e:
-                    print(f'theme playback failed: {e!r}', file=sys.stderr, flush=True)
-        # Notification chimes for chats that just finished, need input, or failed.
+        volume = max(0, min(100, int(cfg_now.get('theme_volume', 60))))
+        music = {r['avatar']: music_for(r['avatar'], cfg_now) for r in rows} if on and players['theme'] else {}
+        if not on:
+            stop_victory()
+        proc = sound['proc']
+        if proc is not None and proc.poll() is not None:  # the track ended (or ffplay could not play it)
+            slot = playlists.get(sound['key'])
+            if slot:
+                if slot['pos'] == 0 and now - sound['since'] < 2:
+                    sound['bad'].add(slot['track'])  # not retried until the monitor restarts
+                slot['track'] = None  # the next start takes the next track in the bag
+            sound.update(proc=None, key=None)
+        # Ready after a battle-length turn plays the character's victory fanfare; otherwise chimes mark
+        # chats that finished, need input, or failed.
         for row in rows:
             before = sound['states'].get(row['id'])
             sound['states'][row['id']] = row['state']
-            if (on and before is not None and before != row['state'] and row['state'] in CHIMES
-                    and not row.get('muted') and players['chime'] and now - sound['chimed'] > 1.5):
-                sound['chimed'] = now
+            if not (on and before is not None and before != row['state'] and row['state'] in CHIMES
+                    and not row.get('muted') and now - sound['chimed'] > 1.5):
+                continue
+            sound['chimed'] = now
+            songs = music.get(row['avatar'], {})
+            wins = [t for t in songs.get('victory', ()) if t not in sound['bad']]
+            if (row['state'] == 'ready' and wins and
+                    (row.get('last_turn') or 0) >= music_setting(cfg_now, 'battle_after')):
+                stop_theme()
+                stop_victory()
+                track = next_track(playlists.setdefault((row['avatar'], 'victory'), {}), wins)
+                seconds = songs.get('victory_seconds') or music_setting(cfg_now, 'victory_seconds')
+                sound['hold'] = now + seconds  # no other music over the fanfare
                 try:
-                    command = [players['chime'], str(chime_path(row['state']))]
-                    if command[0].endswith('ffplay'):
-                        command[1:1] = ['-nodisp', '-autoexit', '-loglevel', 'quiet']
-                    play(command)
+                    sound['victory'] = play([players['theme'], '-nodisp', '-autoexit', '-loglevel', 'quiet',
+                                             '-volume', str(volume), '-t', f'{seconds:.1f}', '-af',
+                                             f'afade=t=out:st={max(0, seconds - 1.5):.1f}:d=1.5', str(track)])
                 except OSError as e:
-                    print(f'chime failed: {e!r}', file=sys.stderr, flush=True)
+                    print(f'victory playback failed: {e!r}', file=sys.stderr, flush=True)
+            elif players['chime']:
+                chime(row['state'])
+        # Background music: one chat at a time, field or battle by how long its turn has run.
+        keys = {}
+        for row in rows:
+            mode = music_mode(row, now, cfg_now) if music else None
+            songs = music.get(row['avatar'], {})
+            if mode == 'battle' and not [t for t in songs.get('battle', ()) if t not in sound['bad']]:
+                mode = 'field'  # no battle music: the field music carries on
+            tracks = [t for t in songs.get(mode, ()) if t not in sound['bad']] if mode else []
+            if tracks:
+                keys[row['id']] = ((row['avatar'], mode), tracks)
+        target = pick_theme(rows, sound['theme'], keys) if on and now >= sound['hold'] else None
+        current = next((r for r in rows if r['id'] == sound['theme']), None)
+        if target == sound['theme'] and target:
+            sound['seen'] = now
+        elif (target is None and current and on and not current.get('muted') and now >= sound['hold']
+              and sound['key'] and now - sound['seen'] < THEME_GRACE):
+            target = sound['theme']  # a short pause between turns
+            keys[target] = (sound['key'], [playlists[sound['key']]['track']])
+        key, tracks = keys.get(target, (None, None))
+        if (target, key) != (sound['theme'], sound['key']) or (target and sound['proc'] is None):
+            stop_theme()
+            if target and tracks:
+                start_music(target, key, tracks, volume, now)
         for sid in list(sound['states']):
             if sid not in cards:
                 sound['states'].pop(sid)
@@ -2028,6 +2164,7 @@ def run_ui():
         root.mainloop()
     finally:
         stop_theme()
+        stop_victory()
         (DATA / 'ui.json').unlink(missing_ok=True)
         lock.close()
 
@@ -2093,7 +2230,10 @@ def main():
                           plan=openai['plan'], source=openai['source'], reached=openai.get('reached'),
                           reset_credits=openai.get('reset_credits'), error=openai.get('error'))
         cfg = config()
-        sound = {'on': cfg.get('sound', True), 'themes': {n: str(theme_for(n, cfg) or '') or None for n in cfg['avatars']},
+        music = {n: music_for(n, cfg) for n in cfg['avatars']}
+        sound = {'on': cfg.get('sound', True),
+                 'music': {n: {k: [f.name for f in v[k]] for k in MUSIC_KINDS} for n, v in music.items()},
+                 'settings': {k: music_setting(cfg, k) for k in MUSIC_DEFAULTS},
                  'theme_player': shutil.which('ffplay'), 'muted_sessions': [r['id'] for r in sessions if r.get('muted')]}
         print(json.dumps({'running': bool(ui_status()), 'enabled': config().get('enabled', True), 'sound': sound,
                           'account': account(), 'limits': limits, 'openai_limits': openai,
@@ -2136,6 +2276,7 @@ def main():
         themes[name] = str(path)
         save_config(c)
         print(f'{name} will play {path.name} while its chat works.'
+              + (' Its music.json field playlist still takes precedence.' if listed_music(c['avatars'][name])['field'] else '')
               + ('' if shutil.which('ffplay') else ' ffplay is not installed, so nothing can play yet.'))
 
 

@@ -705,6 +705,44 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(m.pick_theme(rows, 'c', themes), 'b')   # finished chats stop
         self.assertIsNone(m.pick_theme(rows, None, {'c': 'c.ogg', 'd': 'd.ogg'}))  # no theme, no music
 
+    def test_music_playlists_modes_and_shuffle(self):
+        folder = Path(self.tmp.name) / 'hero'
+        folder.mkdir()
+        for name in ('home.mp3', 'town.ogg', 'fight.mp3', 'win.mp3', 'notes.txt'):
+            (folder / name).write_bytes(b'x')
+        cfg = {'avatars': {'Hero': str(folder)}}
+        self.assertEqual(m.music_for('Hero', cfg)['field'], [])
+        (folder / 'theme.ogg').write_bytes(b'x')
+        self.assertEqual([f.name for f in m.music_for('Hero', cfg)['field']], ['theme.ogg'])  # old single theme
+        (folder / 'music.json').write_text(json.dumps({
+            'field': ['home.mp3', 'town.ogg', 'missing.mp3'], 'battle': 'fight.mp3',
+            'victory': ['win.mp3', 'notes.txt'], 'victory_seconds': 5}))
+        music = m.music_for('Hero', cfg)
+        self.assertEqual([f.name for f in music['field']], ['home.mp3', 'town.ogg'])  # listed files that exist
+        self.assertEqual([f.name for f in music['battle']], ['fight.mp3'])
+        self.assertEqual([f.name for f in music['victory']], ['win.mp3'])
+        self.assertEqual(music['victory_seconds'], 5)
+
+        # Per turn, not per state: short turns stay silent, long ones become battles until they end.
+        row = dict(state='working', turn_started=100)
+        self.assertIsNone(m.music_mode(row, 103, {}))
+        self.assertEqual(m.music_mode(dict(row, state='thinking'), 110, {}), 'field')
+        self.assertEqual(m.music_mode(row, 140, {}), 'battle')
+        self.assertEqual(m.music_mode(dict(row, state='thinking'), 140, {}), 'battle')
+        self.assertIsNone(m.music_mode(dict(row, state='ready', turn_started=None), 140, {}))
+        self.assertEqual(m.music_mode(row, 140, {'battle_after': 60, 'music_delay': 0}), 'field')
+
+        import random
+        rng = random.Random(3)
+        slot, tracks, played = {}, ['a', 'b', 'c'], []
+        for _ in range(30):
+            played.append(m.next_track(slot, tracks, rng))
+            self.assertEqual(slot['pos'], 0.0)
+        for start in range(0, 30, 3):
+            self.assertEqual(sorted(played[start:start + 3]), tracks)  # every track once per round
+        self.assertTrue(all(x != y for x, y in zip(played, played[1:])))  # never twice in a row
+        self.assertEqual(m.next_track({'track': 'a'}, ['a'], rng), 'a')  # a one-track list just repeats
+
     def test_theme_lookup_set_theme_and_mute_survive_hooks(self):
         folder = Path(self.tmp.name) / 'hero'
         folder.mkdir()

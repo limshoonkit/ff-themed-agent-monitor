@@ -39,7 +39,22 @@ Copy your GIFs into `assets/<name>/` or register a separate local folder:
 python3 scripts/monitor.py add-avatar "My Avatar" /absolute/path/to/gifs
 ```
 
-Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. MP3 themes are stored under `assets/<name>/` and are also ignored by Git. The local set is Tifa, Rinoa, Yuna and Lightning.
+Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. The local set is Tifa, Rinoa, Yuna and Lightning.
+
+## Music
+
+Music files go in the character's folder and are ignored by Git. A `music.json` there names them by role:
+
+```json
+{
+  "field": ["Rinoa's Theme.mp3", "Balamb Garden.mp3"],
+  "battle": ["Don't be Afraid.mp3", "Force Your Way.mp3"],
+  "victory": ["Victory Fanfare.mp3"],
+  "victory_seconds": 7
+}
+```
+
+Music follows the whole turn, not each state, because a chat switches between thinking and tool use every few seconds. Tasks shorter than 5 seconds stay silent. After that the field music plays, and a turn longer than 30 seconds switches to battle music until it ends. When a long turn finishes, the victory track plays its opening seconds and fades out; shorter turns get a chime. Each list shuffles without repeating a track twice in a row. Every track also resumes where it stopped, so a run of short tasks moves through a long track instead of replaying its intro. `music_delay`, `battle_after`, `victory_seconds` and `theme_volume` in `config.json` change the timings and volume. `python3 scripts/monitor.py status` shows the playlists each character resolved.
 
 ## Development
 

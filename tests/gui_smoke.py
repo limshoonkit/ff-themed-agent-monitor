@@ -52,8 +52,13 @@ def main():
                       transcript_path=str(day / 'rollout-demo-codex.jsonl')), owner, provider='codex')
         song = Path(temp) / 'tifa-theme.ogg'
         song.write_bytes(b'not really audio')  # never played: m.play is replaced below
-        m.save_config({'enabled': True, 'verbose': True, 'avatars': {'Tifa': str(m.ROOT / 'assets/tifa')},
-                       'themes': {'Tifa': str(song)}})
+        tifa = Path(temp) / 'tifa'  # the sprites without the real folder's music.json
+        tifa.mkdir()
+        for source in (m.ROOT / 'assets/tifa').iterdir():
+            if source.suffix in ('.gif', '.json') and source.name != 'music.json':
+                (tifa / source.name).symlink_to(source)
+        m.save_config({'enabled': True, 'verbose': True, 'avatars': {'Tifa': str(tifa)},
+                       'themes': {'Tifa': str(song)}, 'music_delay': 0})
         plays = []
         class FakePlayer:
             def __init__(self, command):
@@ -115,7 +120,7 @@ def main():
             def check_sound():
                 try:
                     def themes():
-                        return [p for p in plays if '-loop' in p.command]
+                        return [p for p in plays if p.command[-1] == str(song)]
                     def lit():
                         return [w for w in widgets(root) if str(w).endswith('.mute') and w.cget('bg') == '#4a6fa5']
                     assert len(themes()) == 1 and themes()[0].command[-1] == str(song), [p.command for p in plays]
@@ -135,8 +140,21 @@ def main():
                     failures.append(e)
             def check_chime():
                 try:
-                    chimes = [p.command for p in plays if '-loop' not in p.command]
-                    assert len(chimes) == 1 and chimes[0][-1].endswith('ready-v1.wav'), chimes
+                    chimes = [p.command for p in plays if p.command[-1].endswith('.wav')]
+                    assert len(chimes) == 1 and chimes[0][-1].endswith(f'ready-v{m.CHIME_VERSION}.wav'), chimes
+                    # A battle-length turn ends with the character's victory fanfare, cut short, not a chime.
+                    (tifa / 'win.ogg').write_bytes(b'not really audio')
+                    (tifa / 'music.json').write_text('{"victory": ["win.ogg"], "victory_seconds": 4}')
+                    c = m.config(); c['battle_after'] = 0; m.save_config(c)
+                    root.after(1600, lambda: event('demo-working', 'Stop'))  # past the chime spacing
+                    root.after(2500, check_victory)
+                except BaseException as e:
+                    failures.append(e)
+            def check_victory():
+                try:
+                    wins = [p.command for p in plays if p.command[-1].endswith('win.ogg')]
+                    assert len(wins) == 1 and wins[0][wins[0].index('-t') + 1] == '4.0', wins
+                    assert len([p for p in plays if p.command[-1].endswith('.wav')]) == 1  # no extra chime
                     named = {str(w).rsplit('.', 1)[-1]: w for w in widgets(root)}
                     named['help'].invoke()
                     root.after(400, check_help)
@@ -228,14 +246,14 @@ def main():
                     failures.append(AssertionError('timed out: a step never reached check_empty/root.destroy()'))
                     root.destroy()
             root.after(1500, check_initial)
-            root.after(15000, watchdog)
+            root.after(20000, watchdog)
             return root
         tk.Tk = make_root
         m.run_ui()
         if failures:
             raise failures[0]
         assert not (m.DATA / 'ui.json').exists()
-        print('GUI smoke passed: states, verbose details, usage gauges, help popup, avatar picker, Codex card, per-provider usage bars, themes, mutes, chimes, resizing, automatic removal, clean shutdown.')
+        print('GUI smoke passed: states, verbose details, usage gauges, help popup, avatar picker, Codex card, per-provider usage bars, music, mutes, chimes, victory fanfare, resizing, automatic removal, clean shutdown.')
 
 
 if __name__ == '__main__':
