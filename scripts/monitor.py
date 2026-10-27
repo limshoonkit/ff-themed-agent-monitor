@@ -97,11 +97,17 @@ def atomic_json(path, value):
             os.unlink(tmp)
 
 
+def bundled_avatars():
+    """Every assets/<name> directory that has an animation profile or an idle GIF."""
+    found = sorted(d for d in (ROOT / 'assets').glob('*/') if (d / 'animations.json').exists() or (d / 'idle.gif').exists())
+    return {d.name.title(): str(d) for d in found} or {'Tifa': str(ROOT / 'assets/tifa')}
+
+
 def config():
     try:
         return json.loads((DATA / 'config.json').read_text())
     except FileNotFoundError:
-        return {'enabled': True, 'verbose': True, 'avatars': {'Tifa': str(ROOT / 'assets/tifa')}}
+        return {'enabled': True, 'verbose': True, 'avatars': bundled_avatars()}
 
 
 def save_config(value):
@@ -1564,6 +1570,7 @@ def fit_sprite(frame, size=(168, 126)):
 
 
 THEME_EXTS = ('.ogg', '.opus', '.mp3', '.flac', '.m4a', '.wav')
+BACKGROUND_ROTATE = 120  # seconds each background-only chat's music plays before the next one's turn
 THEME_GRACE = 3  # seconds a theme keeps playing through a pause, so back-to-back turns don't restart it
 # Original jingles in a 16-bit RPG style, not tunes from any game. Each note: (start s, Hz, ring s, wave,
 # gain, decay s); 'p25'/'p12' are pulse waves (melody), 'tri' a triangle (bass). Notes ring into each other
@@ -1601,13 +1608,25 @@ def theme_for(name, cfg):
     return None
 
 
-def pick_theme(rows, current, themes):
-    """Which chat's theme plays: only busy, unmuted chats whose character has a theme. The one already
-    playing keeps going; otherwise the chat whose turn started most recently takes over."""
-    eligible = [r for r in rows if r['state'] in BUSY and not r.get('muted') and themes.get(r['id'])]
-    if any(r['id'] == current for r in eligible):
+def pick_theme(rows, current, themes, now=0, picked=0, rotate=BACKGROUND_ROTATE):
+    """Which chat's theme plays: only busy or background, unmuted chats whose character has a theme.
+    Busy chats take priority. The one already playing keeps going; otherwise the chat whose turn started
+    most recently takes over. With only background chats left, the music rotates to the next one every
+    `rotate` seconds (since `picked`)."""
+    live = [r for r in rows if not r.get('muted') and themes.get(r['id'])]
+    eligible = [r for r in live if r['state'] in BUSY]
+    if eligible:
+        if any(r['id'] == current for r in eligible):
+            return current
+        best = max(eligible, key=lambda r: r.get('turn_started') or r.get('updated') or 0)
+        return best['id']
+    eligible = [r for r in live if r['state'] == 'background']
+    ids = [r['id'] for r in eligible]
+    if current in ids:
+        if len(ids) > 1 and now - picked >= rotate:
+            return ids[(ids.index(current) + 1) % len(ids)]
         return current
-    best = max(eligible, key=lambda r: r.get('turn_started') or r.get('updated') or 0, default=None)
+    best = max(eligible, key=lambda r: r.get('updated') or 0, default=None)
     return best and best['id']
 
 
@@ -1669,6 +1688,8 @@ def music_for(name, cfg):
 def music_started(row, now, cfg):
     """Whether a chat's music plays yet: it is busy and its turn has run music_delay seconds, so short
     tasks stay silent. Per turn, not per state: Claude flips between thinking and tools every few seconds."""
+    if row['state'] == 'background':  # its turn is over; the jobs it left running keep a quieter theme going
+        return True
     return (row['state'] in BUSY and bool(row.get('turn_started'))
             and now - row['turn_started'] >= setting(cfg, 'music_delay'))
 
@@ -1843,21 +1864,28 @@ def run_ui():
         return
     if not config().get('enabled', True):
         return
-    card_w, sprite_h = 244, 128
-    frame_border = '#4a6fa5'  # the light steel-blue edge classic RPG dialogue windows use
     root = tk.Tk()
+    # The layout below is designed in pixels at 1x. Follow the display's DPI (Tk reports 96/72 at 96 DPI),
+    # clamped so a misreported DPI stays usable; config.json's ui_scale overrides it.
+    detected = min(2.5, max(1.0, float(root.tk.call('tk', 'scaling')) / (96 / 72)))
+    ui = float(config().get('ui_scale') or detected)
+    px = lambda n: int(round(n * ui))
+    card_w, sprite_h = px(272), px(128)
+    sprite_size = (px(168), px(126))
+    frame_border = '#4a6fa5'  # the light steel-blue edge classic RPG dialogue windows use
+    root.tk.call('tk', 'scaling', 96 / 72 * ui)  # fonts grow with the pixel layout, not the raw display DPI
     root.title('Agent Monitor')
     root.configure(bg='#151b29')
     root.attributes('-topmost', True)
-    root.minsize(card_w + 120, 320)
-    root.geometry(f'420x295+{max(0, root.winfo_screenwidth()-450)}+{max(0,root.winfo_screenheight()-360)}')
+    root.minsize(card_w + px(120), px(320))
+    root.geometry(f'{px(420)}x{px(295)}+{max(0, root.winfo_screenwidth()-px(450))}+{max(0,root.winfo_screenheight()-px(360))}')
     header = tk.Frame(root, bg='#202a3d', padx=12, pady=9,
                       highlightthickness=2, highlightbackground=frame_border)
     header.pack(fill='x')
     title = tk.Label(header, text='AGENT MONITOR', fg='#dce7ff', bg='#202a3d', font=('Sans', 10, 'bold'))
     title.pack(side='left')
     verbose = [config().get('verbose', True)]
-    ui_icons = {name: ImageTk.PhotoImage(draw_ui_icon(name, 18))
+    ui_icons = {name: ImageTk.PhotoImage(draw_ui_icon(name, px(18)))
                 for name in ('help', 'details', 'compact', 'sound', 'muted', 'clock', 'calendar',
                              'long', 'too long', 'cold', 'struggling')}
     def icon_button(name):
@@ -1896,7 +1924,7 @@ def run_ui():
             tk.Label(line, image=ui_icons[glyph], bg=meter_bg).pack(side='left')
             note = tk.Label(line, bg=meter_bg, fg='#aebbd3', font=('Monospace', 8), anchor='e', width=50)
             note.pack(side='right')
-            gauge = tk.Canvas(line, height=10, bg='#151b29',
+            gauge = tk.Canvas(line, height=px(10), bg='#151b29',
                               highlightthickness=1, highlightbackground=frame_border)
             gauge.pack(side='left', fill='x', expand=True, padx=(4, 6))
             meters[provider, stat] = (gauge, note)
@@ -1910,9 +1938,9 @@ def run_ui():
         if view and width > 1:
             left = view['left'] / 100
             fill = ('#84e0bb' if stat == '5h' else '#8bb6ff') if left > .5 else '#ffcf70' if left > .2 else '#ff919b'
-            gauge.create_rectangle(0, 0, max(2, width * left), 10, fill=fill, width=0)
+            gauge.create_rectangle(0, 0, max(2, width * left), px(10), fill=fill, width=0)
             for i in range(1, 4):
-                gauge.create_line(width * i / 4, 0, width * i / 4, 10, fill='#202a3d')
+                gauge.create_line(width * i / 4, 0, width * i / 4, px(10), fill='#202a3d')
     polling, who_cache, openai_cache, codex_polling = [False], [None, 0], [None, 0], [False]
     codex_history = []  # (fetched, percent used) of the short Codex window, for its recent pace
     def start_codex_poll():
@@ -2014,23 +2042,23 @@ def run_ui():
     cfg = config()
     last_ui_info = [None]
     resized = [True]
-    thumbs, encounters, shifts, thumb_h = {}, {}, {}, 54
+    thumbs, encounters, shifts, thumb_h = {}, {}, {}, px(54)
     def load_avatar(name, directory):
         for anim in ANIMATIONS:
             paths = scene_paths(directory, anim)
             encounters[name, anim] = [p.stem for p in paths]
             for path in paths:
                 with Image.open(path) as im:
-                    images[name, anim, path.stem] = [(ImageTk.PhotoImage(fit_sprite(frame)),
+                    images[name, anim, path.stem] = [(ImageTk.PhotoImage(fit_sprite(frame, sprite_size)),
                                            max(40, frame.info.get('duration', 120))) for frame in ImageSequence.Iterator(im)]
         for path in variant_paths(directory, 'busy_shift')[:1]:
             key = (name, 'busy_shift', path.stem)
             with Image.open(path) as im:
-                images[key] = [(ImageTk.PhotoImage(fit_sprite(frame)),
+                images[key] = [(ImageTk.PhotoImage(fit_sprite(frame, sprite_size)),
                                 max(40, frame.info.get('duration', 120))) for frame in ImageSequence.Iterator(im)]
             shifts[name] = key
         with Image.open(gif_for(directory, 'idle')) as im:
-            thumbs[name] = ImageTk.PhotoImage(fit_sprite(im, (72,54)))
+            thumbs[name] = ImageTk.PhotoImage(fit_sprite(im, (px(72), px(54))))
     def reload_avatars():
         """Pick up avatars registered with add-avatar since the window opened."""
         for name, directory in config()['avatars'].items():
@@ -2042,13 +2070,13 @@ def run_ui():
                 cfg['avatars'][name] = directory
     for name, directory in cfg['avatars'].items():
         load_avatar(name, directory)
-    state_icons = {state: ImageTk.PhotoImage(draw_icon(state, 20)) for state in LABELS}
+    state_icons = {state: ImageTk.PhotoImage(draw_icon(state, px(20))) for state in LABELS}
     def card_h():
-        return 395 if verbose[0] else 245
+        return px(395 if verbose[0] else 245)
     def layout(event=None):
-        width = max(card_w + 16, canvas.winfo_width())
+        width = max(card_w + px(16), canvas.winfo_width())
         canvas.itemconfigure(board_id, width=width)
-        cols = max(1, width // (card_w + 16))
+        cols = min(3, max(1, width // (card_w + px(16))))
         for i, card in enumerate(cards.values()):
             card['frame'].grid(row=i//cols, column=i%cols, padx=7, pady=8, sticky='n')
         for i in range(cols):
@@ -2086,38 +2114,35 @@ def run_ui():
         top.overrideredirect(True)  # no OS title bar: the drawn frame is the whole window
         top.attributes('-topmost', True)
         help_window[0] = top
-        w, pad = 600, 24
+        w, pad = px(780), px(24)
         c = tk.Canvas(top, width=w, height=700, bg='#151b29', highlightthickness=0, bd=0)
         c.pack()
         y = pad
         c.create_text(pad, y, anchor='nw', text='AGENT MONITOR', fill='#ffffff', font=('Sans', 12, 'bold'))
-        y += 32
+        y += px(32)
         for heading, body in HELP_SECTIONS:
             c.create_text(pad, y, anchor='nw', text=heading, fill='#ffd98a', font=('Sans', 9, 'bold'))
-            y += 19
-            if body is None:  # the state legend in two columns, with the same icons the cards use
-                states = list(HELP_STATES.items())
-                half = (len(states) + 1) // 2
-                for i, (state, meaning) in enumerate(states):
-                    x, row_y = pad + 2 + (i // half) * (w - 2 * pad) // 2, y + (i % half) * 23
-                    c.create_image(x, row_y, anchor='nw', image=state_icons[state])
-                    c.create_text(x + 30, row_y + 2, anchor='nw', fill='#f0f4ff', font=('Sans', 9),
-                                  text=f'{LABELS[state]}  —  {meaning}')
-                y += half * 23
+            y += px(19)
+            if body is None:  # the state legend, one wrapped line per state, with the same icons the cards use
+                for state, meaning in HELP_STATES.items():
+                    c.create_image(pad + 2, y, anchor='nw', image=state_icons[state])
+                    item = c.create_text(pad + px(30), y + 2, anchor='nw', fill='#f0f4ff', font=('Sans', 9),
+                                         text=f'{LABELS[state]}  —  {meaning}', width=w - 2 * pad - px(30))
+                    y = max(y + px(23), c.bbox(item)[3] + px(5))
             elif body == 'marks':  # the card marks, with the same icons
                 for kind, meaning in HELP_MARKS:
                     c.create_image(pad + 2, y, anchor='nw', image=ui_icons[kind])
-                    item = c.create_text(pad + 32, y + 1, anchor='nw', fill='#f0f4ff', font=('Sans', 9),
-                                         text=meaning, width=w - 2 * pad - 32)
-                    y = max(y + 23, c.bbox(item)[3] + 5)
-                c.create_text(pad, y, anchor='nw', fill='#c2cce0', font=('Sans', 8),
-                              text='These appear after a card\'s status; hover one for its numbers.')
-                y += 16
+                    item = c.create_text(pad + px(32), y + 1, anchor='nw', fill='#f0f4ff', font=('Sans', 9),
+                                         text=meaning, width=w - 2 * pad - px(32))
+                    y = max(y + px(23), c.bbox(item)[3] + px(5))
+                item = c.create_text(pad, y, anchor='nw', fill='#c2cce0', font=('Sans', 8), width=w - 2 * pad,
+                                     text='These appear after a card\'s status; hover one for its numbers.')
+                y = c.bbox(item)[3] + px(2)
             else:
                 item = c.create_text(pad, y, anchor='nw', text=body, width=w - 2 * pad,
                                      fill='#f0f4ff', font=('Sans', 9))
                 y = c.bbox(item)[3]
-            y += 13
+            y += px(13)
         ok = c.create_text(w - pad, y, anchor='ne', text='▶ OK', fill='#ffffff',
                            font=('Sans', 10, 'bold'), tags='ok')
         h = c.bbox(ok)[3] + pad
@@ -2165,7 +2190,7 @@ def run_ui():
         top.overrideredirect(True)
         top.attributes('-topmost', True)
         picker[:] = [top, sid]
-        w, pad, line = 260, 20, thumb_h + 10
+        w, pad, line = px(260), px(20), thumb_h + px(10)
         c = tk.Canvas(top, width=w, height=600, bg='#151b29', highlightthickness=0, bd=0)
         c.pack()
         y = pad
@@ -2205,7 +2230,8 @@ def run_ui():
     root.bind('<Button-1>', click_outside, add='+')
     root.bind('<Escape>', close_picker, add='+')
     sound = {'theme': None, 'key': None, 'proc': None, 'since': 0.0, 'seen': 0.0, 'states': {}, 'chimed': 0.0,
-             'hold': 0.0, 'victory': None, 'bad': set(), 'moods': {}, 'per_chat': {}}
+             'hold': 0.0, 'victory': None, 'bad': set(), 'moods': {}, 'per_chat': {}, 'picked': 0.0,
+             'volume': None}
     usage = {}  # provider -> (lowest percent left, limit reached), kept by update_gauges for the music
     playlists = {}  # (avatar, kind) -> {'track', 'pos', 'bag'}: where each character's music left off
     players = {'chime': next(filter(None, map(shutil.which, ('pw-play', 'aplay', 'ffplay'))), None),
@@ -2243,6 +2269,7 @@ def run_ui():
             sound['victory'].terminate()
         sound.update(victory=None, hold=0.0)
     def start_music(sid, key, tracks, volume, now):
+        sound['volume'] = volume
         slot = playlists.setdefault(key, {'track': None, 'pos': 0.0, 'bag': []})
         if slot['track'] not in tracks:
             next_track(slot, tracks)
@@ -2266,6 +2293,7 @@ def run_ui():
         on = sound_on()
         cfg_now = config()
         volume = max(0, min(100, int(cfg_now.get('theme_volume', 60))))
+        quiet = max(0, min(100, int(cfg_now.get('background_volume', volume // 3))))  # background jobs, not a turn
         music = {r['avatar']: music_for(r['avatar'], cfg_now) for r in rows} if on and players['theme'] else {}
         if not on:
             stop_victory()
@@ -2317,7 +2345,7 @@ def run_ui():
             kind, tracks = mood_tracks(music.get(row['avatar'], {}), mood, sound['bad'])
             if tracks:
                 keys[row['id']] = ((row['avatar'], kind), tracks)
-        target = pick_theme(rows, sound['theme'], keys) if on and now >= sound['hold'] else None
+        target = pick_theme(rows, sound['theme'], keys, now, sound['picked']) if on and now >= sound['hold'] else None
         current = next((r for r in rows if r['id'] == sound['theme']), None)
         if target == sound['theme'] and target:
             sound['seen'] = now
@@ -2326,10 +2354,15 @@ def run_ui():
             target = sound['theme']  # a short pause between turns
             keys[target] = (sound['key'], [playlists[sound['key']]['track']])
         key, tracks = keys.get(target, (None, None))
-        if (target, key) != (sound['theme'], sound['key']) or (target and sound['proc'] is None):
+        chosen = next((r for r in rows if r['id'] == target), None)
+        level = quiet if chosen and chosen['state'] == 'background' else volume
+        if (target, key) != (sound['theme'], sound['key']) or (target and sound['proc'] is None) \
+                or (target and level != sound['volume']):
+            if target != sound['theme']:
+                sound['picked'] = now
             stop_theme()
             if target and tracks:
-                start_music(target, key, tracks, volume, now)
+                start_music(target, key, tracks, level, now)
         for sid in list(sound['states']):
             if sid not in cards:
                 sound['states'].pop(sid)
@@ -2383,7 +2416,7 @@ def run_ui():
             marks[kind].bind('<Enter>', lambda e, w=marks[kind]: show_tip(w))
             marks[kind].bind('<Leave>', hide_tip)
         info = tk.Frame(frame, bg='#202a3d')
-        bar = tk.Canvas(info, height=6, bg='#151b29', highlightthickness=0, width=card_w - 16)
+        bar = tk.Canvas(info, height=px(6), bg='#151b29', highlightthickness=0, width=card_w - px(16))
         text = tk.Label(info, bg='#202a3d', fg='#aebbd3', font=('Monospace', 8), justify='left', anchor='w')
         text.pack(fill='x')
         bar.pack(fill='x', pady=(3, 0))
@@ -2491,9 +2524,9 @@ def run_ui():
                     bar = card['bar']
                     bar.delete('all')
                     if shown is not None:
-                        width = card_w - 16
+                        width = card_w - px(16)
                         fill = '#84e0bb' if shown < .5 else '#ffcf70' if shown < .8 else '#ff919b'
-                        bar.create_rectangle(0, 0, max(2, width * shown), 6, fill=fill, width=0)
+                        bar.create_rectangle(0, 0, max(2, width * shown), px(6), fill=fill, width=0)
         update_gauges(rows, now)
         audio(rows, now)
         visual_cfg = config()
@@ -2507,9 +2540,9 @@ def run_ui():
             card['frame'].configure(highlightbackground=border)
         count.configure(text=f'{len(rows)} chat' + ('' if len(rows) == 1 else 's'))
         if changed:
-            columns = min(max(1, len(rows)), 4, max(1, (root.winfo_screenwidth()-80)//(card_w+16)))
-            width = max(360, columns*(card_w+16)+38)
-            top = header.winfo_reqheight() + gauges.winfo_reqheight() + 40  # the OpenAI box comes and goes
+            columns = min(max(1, len(rows)), 3, max(1, (root.winfo_screenwidth()-80)//(card_w+px(16))))
+            width = max(px(360), columns*(card_w+px(16))+px(38))
+            top = header.winfo_reqheight() + gauges.winfo_reqheight() + px(40)  # the OpenAI box comes and goes
             height = min(root.winfo_screenheight()-100, min(2, max(1, (len(rows)+columns-1)//columns))*card_h()+top)
             x = max(0, min(root.winfo_x(), root.winfo_screenwidth()-width-30))
             y = max(0, min(root.winfo_y(), root.winfo_screenheight()-height-50))

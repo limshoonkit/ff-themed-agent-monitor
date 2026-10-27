@@ -16,6 +16,7 @@ spec.loader.exec_module(m)
 def main():
     with tempfile.TemporaryDirectory(prefix='agent-monitor-gui-') as temp:
         m.DATA = Path(temp) / 'state'
+        m.save_config({'enabled': True, 'ui_scale': 1.5, 'avatars': {'Tifa': str(m.ROOT / 'assets/tifa')}})  # chats are assigned an avatar as they start
         m.CLAUDE = Path(temp) / 'claude'
         m.CLAUDE_JSON = Path(temp) / '.claude.json'
         m.CODEX = Path(temp) / 'codex'
@@ -57,7 +58,7 @@ def main():
         for source in (m.ROOT / 'assets/tifa').iterdir():
             if source.suffix in ('.gif', '.json') and source.name != 'music.json':
                 (tifa / source.name).symlink_to(source)
-        m.save_config({'enabled': True, 'verbose': True, 'avatars': {'Tifa': str(tifa)},
+        m.save_config({'enabled': True, 'verbose': True, 'ui_scale': 1.5, 'avatars': {'Tifa': str(tifa)},
                        'themes': {'Tifa': str(song)}, 'music_delay': 0,
                        'chimes': ['ready', 'waiting', 'failed']})  # Ready is off by default
         plays = []
@@ -265,9 +266,9 @@ def main():
             def capture_and_remove():
                 try:
                     sprites = [w for w in widgets(root) if isinstance(w,tk.Label) and w.cget('image') and
-                               int(root.tk.call('image','width',w.cget('image'))) == 168]
+                               int(root.tk.call('image','width',w.cget('image'))) == round(168 * 1.5)]
                     assert len(sprites) == len(demos) + 1  # plus the Codex card
-                    assert all(int(root.tk.call('image','height',w.cget('image'))) == 126 for w in sprites)
+                    assert all(int(root.tk.call('image','height',w.cget('image'))) == round(126 * 1.5) for w in sprites)
                     if len(sys.argv) > 1:
                         from PIL import ImageGrab
                         root.update()
