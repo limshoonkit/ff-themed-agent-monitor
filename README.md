@@ -43,18 +43,31 @@ Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.
 
 ## Music
 
-Music files go in the character's folder and are ignored by Git. A `music.json` there names them by role:
+Music files go in the character's folder and are ignored by Git. A `music.json` there names them by mood:
 
 ```json
 {
-  "field": ["Rinoa's Theme.mp3", "Balamb Garden.mp3"],
-  "battle": ["Don't be Afraid.mp3", "Force Your Way.mp3"],
+  "field": ["Rinoa's Theme.mp3", "Balamb Garden.mp3", "Blue Fields.mp3"],
+  "battle": ["Don't be Afraid.mp3", "Man with the Machine Gun.mp3"],
+  "boss": ["Force Your Way.mp3", "The Extreme.mp3"],
   "victory": ["Victory Fanfare.mp3"],
   "victory_seconds": 7
 }
 ```
 
-Music follows the whole turn, not each state, because a chat switches between thinking and tool use every few seconds. Tasks shorter than 5 seconds stay silent. After that the field music plays, and a turn longer than 30 seconds switches to battle music until it ends. When a long turn finishes, the victory track plays its opening seconds and fades out; shorter turns get a chime. Each list shuffles without repeating a track twice in a row. Every track also resumes where it stopped, so a run of short tasks moves through a long track instead of replaying its intro. `music_delay`, `battle_after`, `victory_seconds` and `theme_volume` in `config.json` change the timings and volume. `python3 scripts/monitor.py status` shows the playlists each character resolved.
+The usage bars set the mood, using the chat's own provider and its lowest window:
+
+| Usage left | Music |
+|---|---|
+| above 50% | field |
+| 20–50% | battle |
+| below 20% | boss |
+
+A mood only changes once usage is 5 points past a threshold, so estimated readings near 50% or 20% don't make the music flip back and forth. A character with no tracks for a mood plays the next calmer one.
+
+Music starts once a task has run for 5 seconds, so quick replies stay silent. Music follows the whole turn rather than each state, because a chat switches between thinking and tool use every few seconds. When a task of 30 seconds or more finishes, the victory track plays its opening seconds and fades out; shorter tasks get a chime. Each list shuffles without repeating a track twice in a row. Every track also resumes where it stopped, so a run of short tasks moves through a long track instead of replaying its intro.
+
+`calm_above`, `boss_below`, `music_delay`, `victory_after`, `victory_seconds` and `theme_volume` in `config.json` change the thresholds, timings and volume. `python3 scripts/monitor.py status` shows the playlists each character resolved.
 
 ## Development
 

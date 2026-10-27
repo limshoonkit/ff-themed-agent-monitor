@@ -1,9 +1,16 @@
 {
   "field": [
-    "Tifa's Theme.mp3"
+    "Tifa's Theme.mp3",
+    "main theme.mp3",
+    "Reunion.mp3",
+    "Nightfall in the Undercity.mp3"
   ],
   "battle": [
     "Let the Battles Begin.mp3"
+  ],
+  "boss": [
+    "Still More Fighting.mp3",
+    "one winged angel.mp3"
   ],
   "victory": [
     "Victory Theme.mp3"

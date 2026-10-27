@@ -145,7 +145,7 @@ def main():
                     # A battle-length turn ends with the character's victory fanfare, cut short, not a chime.
                     (tifa / 'win.ogg').write_bytes(b'not really audio')
                     (tifa / 'music.json').write_text('{"victory": ["win.ogg"], "victory_seconds": 4}')
-                    c = m.config(); c['battle_after'] = 0; m.save_config(c)
+                    c = m.config(); c['victory_after'] = 0; m.save_config(c)
                     root.after(1600, lambda: event('demo-working', 'Stop'))  # past the chime spacing
                     root.after(2500, check_victory)
                 except BaseException as e:

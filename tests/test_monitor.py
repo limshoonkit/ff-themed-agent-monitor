@@ -715,22 +715,44 @@ class MonitorTests(unittest.TestCase):
         (folder / 'theme.ogg').write_bytes(b'x')
         self.assertEqual([f.name for f in m.music_for('Hero', cfg)['field']], ['theme.ogg'])  # old single theme
         (folder / 'music.json').write_text(json.dumps({
-            'field': ['home.mp3', 'town.ogg', 'missing.mp3'], 'battle': 'fight.mp3',
+            'field': ['home.mp3', 'town.ogg', 'missing.mp3'], 'battle': 'fight.mp3', 'final': ['fight.mp3'],  # no such mood: ignored
             'victory': ['win.mp3', 'notes.txt'], 'victory_seconds': 5}))
         music = m.music_for('Hero', cfg)
         self.assertEqual([f.name for f in music['field']], ['home.mp3', 'town.ogg'])  # listed files that exist
         self.assertEqual([f.name for f in music['battle']], ['fight.mp3'])
+        self.assertEqual(music['boss'], [])
+        self.assertNotIn('final', music)
         self.assertEqual([f.name for f in music['victory']], ['win.mp3'])
         self.assertEqual(music['victory_seconds'], 5)
 
-        # Per turn, not per state: short turns stay silent, long ones become battles until they end.
+        # Music starts per turn, not per state: short tasks stay silent.
         row = dict(state='working', turn_started=100)
-        self.assertIsNone(m.music_mode(row, 103, {}))
-        self.assertEqual(m.music_mode(dict(row, state='thinking'), 110, {}), 'field')
-        self.assertEqual(m.music_mode(row, 140, {}), 'battle')
-        self.assertEqual(m.music_mode(dict(row, state='thinking'), 140, {}), 'battle')
-        self.assertIsNone(m.music_mode(dict(row, state='ready', turn_started=None), 140, {}))
-        self.assertEqual(m.music_mode(row, 140, {'battle_after': 60, 'music_delay': 0}), 'field')
+        self.assertFalse(m.music_started(row, 103, {}))
+        self.assertTrue(m.music_started(dict(row, state='thinking'), 110, {}))
+        self.assertFalse(m.music_started(dict(row, state='ready', turn_started=None), 140, {}))
+        self.assertTrue(m.music_started(row, 100, {'music_delay': 0}))
+
+        # The mood follows the provider's usage left, with a margin so estimates near a threshold don't flicker.
+        mood = lambda left, prev=None, reached=False, cfg={}: m.music_mood(left, reached, prev, cfg)
+        self.assertEqual([mood(x) for x in (90, 51, 50, 21, 20, 5)], ['field', 'field', 'battle', 'battle', 'boss', 'boss'])
+        self.assertEqual(mood(0), 'boss')
+        self.assertEqual(mood(60, 'battle', reached=True), 'boss')
+        self.assertEqual(mood(None), 'field')
+        self.assertEqual(mood(None, 'boss'), 'boss')  # no reading keeps the mood
+        self.assertEqual(mood(48, 'field'), 'field')  # just under 50: not yet
+        self.assertEqual(mood(44, 'field'), 'battle')
+        self.assertEqual(mood(53, 'battle'), 'battle')  # just over 50: not yet
+        self.assertEqual(mood(56, 'battle'), 'field')
+        self.assertEqual(mood(18, 'battle'), 'battle')
+        self.assertEqual(mood(14, 'battle'), 'boss')
+        self.assertEqual(mood(30, 'boss', reached=False), 'battle')  # a limit that resets drops straight to its level
+        self.assertEqual(mood(70, cfg={'calm_above': 80, 'boss_below': 40}), 'battle')
+        self.assertEqual(m.usage_left({'five_hour': {'left': 70.0}, 'seven_day': {'left': 35.5}, 'x': None}), 35.5)
+        self.assertIsNone(m.usage_left({}))
+        songs = {'field': ['f'], 'boss': ['b', 'broken']}
+        self.assertEqual(m.mood_tracks(songs, 'boss', {'broken'}), ('boss', ['b']))  # unplayable files skipped
+        self.assertEqual(m.mood_tracks(songs, 'battle'), ('field', ['f']))  # no battle music: field carries on
+        self.assertEqual(m.mood_tracks({}, 'boss'), (None, []))
 
         import random
         rng = random.Random(3)

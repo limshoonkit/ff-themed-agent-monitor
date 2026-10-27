@@ -1173,9 +1173,9 @@ HELP_SECTIONS = (
                 'on this computer. The monitor never sends messages to either and never spends tokens; '
                 'the usage bars check every few minutes: one small request to Anthropic with your Claude '
                 'login, and one to OpenAI that Codex makes itself (the monitor never reads that login).'),
-    ('SOUND', 'A character with music plays it while its chat works, one chat at a time: calm music once '
-              'a task has run a few seconds, battle music for long tasks, and a victory fanfare when a '
-              'long task finishes. Tracks shuffle and pick up where they left off. Chimes mark a chat that '
+    ('SOUND', 'A character with music plays it while its chat works, one chat at a time. The usage bars '
+              'set the mood: calm field music while plenty is left, battle music when it runs low, and '
+              'boss music when it is nearly gone. A long task ends with a victory fanfare. Tracks shuffle and pick up where they left off. Chimes mark a chat that '
               'finished, needs your answer, or failed. The speaker on a card silences that chat; the one '
               'at the top silences everything.'),
     ('TIPS', 'Click the name under an avatar to pick a different character for that chat. '
@@ -1456,8 +1456,10 @@ def pick_theme(rows, current, themes):
     return best and best['id']
 
 
-MUSIC_KINDS = ('field', 'battle', 'victory')
-MUSIC_DEFAULTS = {'music_delay': 5, 'battle_after': 30, 'victory_seconds': 7}
+MOODS = ('field', 'battle', 'boss')  # calmer to more urgent, by how much usage is left
+MUSIC_KINDS = MOODS + ('victory',)
+MUSIC_DEFAULTS = {'music_delay': 5, 'victory_after': 30, 'victory_seconds': 7, 'calm_above': 50, 'boss_below': 20}
+MOOD_MARGIN = 5  # usage points past a threshold before the mood changes, so estimates can't make it flicker
 _music_specs = {}  # music.json path -> (mtime, parsed)
 
 
@@ -1467,8 +1469,8 @@ def music_setting(cfg, key):
 
 
 def listed_music(directory):
-    """{'field': [...], 'battle': [...], 'victory': [...]} of existing files named in the folder's music.json,
-    plus its optional 'victory_seconds'."""
+    """{'field': [...], 'battle': [...], 'boss': [...], 'victory': [...]} of existing files named in the
+    folder's music.json, plus its optional 'victory_seconds'."""
     found = {kind: [] for kind in MUSIC_KINDS}
     path = Path(directory) / 'music.json' if directory else None
     try:
@@ -1500,16 +1502,46 @@ def music_for(name, cfg):
     return found
 
 
-def music_mode(row, now, cfg):
-    """'field' or 'battle' for a busy chat, None before its music starts. Chosen per turn, not per state:
-    Claude flips between thinking and tools every few seconds, so a turn gets field music once it has run
-    music_delay seconds (short tasks stay silent) and becomes a battle after battle_after, until it ends."""
-    if row['state'] not in BUSY or not row.get('turn_started'):
-        return None
-    age = now - row['turn_started']
-    if age < music_setting(cfg, 'music_delay'):
-        return None
-    return 'battle' if age >= music_setting(cfg, 'battle_after') else 'field'
+def music_started(row, now, cfg):
+    """Whether a chat's music plays yet: it is busy and its turn has run music_delay seconds, so short
+    tasks stay silent. Per turn, not per state: Claude flips between thinking and tools every few seconds."""
+    return (row['state'] in BUSY and bool(row.get('turn_started'))
+            and now - row['turn_started'] >= music_setting(cfg, 'music_delay'))
+
+
+def usage_left(views):
+    """The lowest percent left across a provider's usage windows; None without a reading."""
+    lefts = [v['left'] for v in (views or {}).values() if v]
+    return min(lefts) if lefts else None
+
+
+def music_mood(left, reached, previous, cfg):
+    """The music's mood from a provider's usage: plenty left is field, getting low is battle, critical or
+    reached is boss (a reached limit stops the chat, so it rarely plays). A change waits until usage is
+    MOOD_MARGIN points past the threshold; without a reading the previous mood stays (field at first)."""
+    if reached or (left is not None and left <= 0):
+        return 'boss'
+    if left is None:
+        return previous or 'field'
+    calm, critical = music_setting(cfg, 'calm_above'), music_setting(cfg, 'boss_below')
+    level = lambda x: 0 if x > calm else 1 if x > critical else 2
+    mood = level(left)
+    if previous in MOODS:
+        before = MOODS.index(previous)
+        if mood > before:
+            mood = max(before, level(left + MOOD_MARGIN))
+        elif mood < before:
+            mood = min(before, level(left - MOOD_MARGIN))
+    return MOODS[mood]
+
+
+def mood_tracks(songs, mood, bad=()):
+    """The playable tracks for a mood, stepping down to a calmer one the character has no music for."""
+    for kind in MOODS[MOODS.index(mood)::-1]:
+        tracks = [t for t in songs.get(kind, ()) if t not in bad]
+        if tracks:
+            return kind, tracks
+    return None, []
 
 
 def next_track(slot, tracks, rng=random):
@@ -1695,6 +1727,7 @@ def run_ui():
         views = limit_view(state, now) if state.get('account') == (acct and acct['email']) else {}
         for (key, span), stat in zip(WINDOWS, ('5h', '7d')):
             draw_meter('anthropic', stat, views.get(key), f'{span} · ' + limit_text(views.get(key), state, now))
+        usage['anthropic'] = (usage_left(views), False)
         if now - openai_cache[1] > 15:  # Codex also logs a fresh reading with each response
             openai_cache[:] = [codex_limits(now), now]
         reading = openai_cache[0]
@@ -1703,6 +1736,7 @@ def run_ui():
         if not codex_polling[0] and now - codex_state.get('checked', 0) >= (60 if reset_passed else POLL_SECONDS):
             start_codex_poll()
         box, who = boxes['openai']
+        usage['openai'] = (usage_left(codex_view(reading, now)), bool((reading or {}).get('reached')))
         if not reading or not reading.get('windows'):
             if box.winfo_manager():
                 box.pack_forget()
@@ -1906,7 +1940,8 @@ def run_ui():
     root.bind('<Button-1>', click_outside, add='+')
     root.bind('<Escape>', close_picker, add='+')
     sound = {'theme': None, 'key': None, 'proc': None, 'since': 0.0, 'seen': 0.0, 'states': {}, 'chimed': 0.0,
-             'hold': 0.0, 'victory': None, 'bad': set()}
+             'hold': 0.0, 'victory': None, 'bad': set(), 'moods': {}}
+    usage = {}  # provider -> (lowest percent left, limit reached), kept by update_gauges for the music
     playlists = {}  # (avatar, kind) -> {'track', 'pos', 'bag'}: where each character's music left off
     players = {'chime': next(filter(None, map(shutil.which, ('pw-play', 'aplay', 'ffplay'))), None),
                'theme': shutil.which('ffplay')}
@@ -1985,7 +2020,7 @@ def run_ui():
             songs = music.get(row['avatar'], {})
             wins = [t for t in songs.get('victory', ()) if t not in sound['bad']]
             if (row['state'] == 'ready' and wins and
-                    (row.get('last_turn') or 0) >= music_setting(cfg_now, 'battle_after')):
+                    (row.get('last_turn') or 0) >= music_setting(cfg_now, 'victory_after')):
                 stop_theme()
                 stop_victory()
                 track = next_track(playlists.setdefault((row['avatar'], 'victory'), {}), wins)
@@ -1999,16 +2034,17 @@ def run_ui():
                     print(f'victory playback failed: {e!r}', file=sys.stderr, flush=True)
             elif players['chime']:
                 chime(row['state'])
-        # Background music: one chat at a time, field or battle by how long its turn has run.
+        # Background music: one chat at a time, its mood set by how much of its provider's usage is left.
+        for provider, (left, reached) in usage.items():
+            sound['moods'][provider] = music_mood(left, reached, sound['moods'].get(provider), cfg_now)
         keys = {}
         for row in rows:
-            mode = music_mode(row, now, cfg_now) if music else None
-            songs = music.get(row['avatar'], {})
-            if mode == 'battle' and not [t for t in songs.get('battle', ()) if t not in sound['bad']]:
-                mode = 'field'  # no battle music: the field music carries on
-            tracks = [t for t in songs.get(mode, ()) if t not in sound['bad']] if mode else []
+            if not (music and music_started(row, now, cfg_now)):
+                continue
+            mood = sound['moods'].get('openai' if row.get('provider') == 'codex' else 'anthropic', 'field')
+            kind, tracks = mood_tracks(music.get(row['avatar'], {}), mood, sound['bad'])
             if tracks:
-                keys[row['id']] = ((row['avatar'], mode), tracks)
+                keys[row['id']] = ((row['avatar'], kind), tracks)
         target = pick_theme(rows, sound['theme'], keys) if on and now >= sound['hold'] else None
         current = next((r for r in rows if r['id'] == sound['theme']), None)
         if target == sound['theme'] and target:
@@ -2217,12 +2253,14 @@ def main():
         if now - state.get('checked', 0) >= POLL_SECONDS or state.get('account') != (account() or {}).get('email'):
             state = poll_limits(now)
         views = limit_view(state, now)
+        moods = {'anthropic': music_mood(usage_left(views), False, None, config())}
         limits = {span: limit_text(views.get(key), state, now) for key, span in WINDOWS}
         limits.update(source=state.get('source'), error=state.get('error'), other=state.get('extra'),
                       calibrated=sorted(state.get('rates') or {}))
         if now - load_codex_state().get('checked', 0) >= POLL_SECONDS:
             poll_codex_limits(now)
         openai = codex_limits(now)
+        moods['openai'] = music_mood(usage_left(codex_view(openai, now)), bool((openai or {}).get('reached')), None, config())
         if openai and openai.get('windows'):
             views = codex_view(openai, now)
             openai = dict({window_span(w['minutes'], key): limit_text(views.get(key), openai, now)
@@ -2233,7 +2271,7 @@ def main():
         music = {n: music_for(n, cfg) for n in cfg['avatars']}
         sound = {'on': cfg.get('sound', True),
                  'music': {n: {k: [f.name for f in v[k]] for k in MUSIC_KINDS} for n, v in music.items()},
-                 'settings': {k: music_setting(cfg, k) for k in MUSIC_DEFAULTS},
+                 'settings': {k: music_setting(cfg, k) for k in MUSIC_DEFAULTS}, 'moods': moods,
                  'theme_player': shutil.which('ffplay'), 'muted_sessions': [r['id'] for r in sessions if r.get('muted')]}
         print(json.dumps({'running': bool(ui_status()), 'enabled': config().get('enabled', True), 'sound': sound,
                           'account': account(), 'limits': limits, 'openai_limits': openai,

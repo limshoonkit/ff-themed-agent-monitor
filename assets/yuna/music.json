@@ -2,7 +2,15 @@
   "field": [
     "Yuna's Theme.mp3",
     "To Zanarkand.mp3",
+    "Hymn of the Fayth.mp3",
     "Suteki da ne.mp3"
+  ],
+  "battle": [
+    "Battle Theme.mp3",
+    "Enemy Attack.mp3"
+  ],
+  "boss": [
+    "challenge.mp3"
   ],
   "victory": [
     "Victory Fanfare.mp3"

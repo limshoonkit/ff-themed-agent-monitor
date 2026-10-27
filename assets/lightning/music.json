@@ -1,10 +1,17 @@
 {
   "field": [
     "Lightning's Theme.mp3",
-    "the promise.mp3"
+    "the promise.mp3",
+    "Sunleth WaterScape.mp3",
+    "Archylte Steppe.mp3",
+    "Kimi Ga Iru Kara.mp3",
+    "Fabula Nova Crystallis.mp3"
   ],
   "battle": [
     "blinded by light.mp3"
+  ],
+  "boss": [
+    "Saber's Edge.mp3"
   ],
   "victory": [
     "Victory Fanfare.mp3"
