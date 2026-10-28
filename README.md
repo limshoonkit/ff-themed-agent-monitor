@@ -90,11 +90,11 @@ The music follows your pace: how much of each usage window you'll have used by i
 | 80–100% | battle |
 | over 100%, or under 10% left | boss |
 
-A mood only changes once the projection is 5 points past a threshold, so estimated readings don't make the music flip back and forth. A character with no tracks for a mood plays the next calmer one.
+A mood only changes once the projection is 5 points past a threshold, so estimated readings don't make the music flip back and forth. The mood does not lock a playlist; it tilts the odds. Each time a track is drawn, field, battle or boss is picked by weight (calm: 70/22/8, battle: 25/50/25, boss: 8/27/65), so boss music turns up more as your allowance runs low and field music when plenty is left, while every list keeps a chance. A kind the character has no tracks for is skipped, and the drawn track plays to its end before the next draw.
 
 Music starts once a task has run for 5 seconds, so quick replies stay silent. Music follows the whole turn rather than each state, because a chat switches between thinking and tool use every few seconds. When a task of 30 seconds or more finishes, the victory track plays its opening seconds and fades out; shorter tasks get a chime. Each list shuffles without repeating a track twice in a row. Every track also resumes where it stopped, so a run of short tasks moves through a long track instead of replaying its intro.
 
-When a chat's turn is over but it still has background jobs or subagents running, its music keeps playing at a lower volume (`background_volume`, default half of `theme_volume`). A running task always takes priority over background music; with only background chats left, the music rotates between them every 90 seconds. Idle, ready, error and needs-input chats play nothing.
+When a chat's turn is over but it still has background jobs or subagents running, its music keeps playing at a lower volume (`background_volume`, default half of `theme_volume`). A running task always takes priority over background music; with only background chats left, the music rotates between them every 120 seconds. Idle, ready, error and needs-input chats play nothing.
 
 `pace_calm`, `pace_limit`, `boss_left`, `music_delay`, `victory_after`, `victory_seconds`, `theme_volume` and `background_volume` in `config.json` change the thresholds, timings and volume. `python3 scripts/monitor.py status` shows the playlists each character resolved.
 

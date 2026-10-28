@@ -1773,13 +1773,20 @@ def pace_text(projected):
     return '' if projected is None else f' · pace {min(projected, 999):.0f}%'
 
 
-def mood_tracks(songs, mood, bad=()):
-    """The playable tracks for a mood, stepping down to a calmer one the character has no music for."""
-    for kind in MOODS[MOODS.index(mood)::-1]:
-        tracks = [t for t in songs.get(kind, ()) if t not in bad]
-        if tracks:
-            return kind, tracks
-    return None, []
+MOOD_MIX = {  # chance weights of drawing a field/battle/boss track while the pace is in each mood
+    'field': {'field': 70, 'battle': 22, 'boss': 8},
+    'battle': {'field': 25, 'battle': 50, 'boss': 25},
+    'boss': {'field': 8, 'battle': 27, 'boss': 65}}
+
+
+def mood_tracks(songs, mood, bad=(), rng=random):
+    """A kind drawn by the mood's weights among the kinds the character has playable tracks for (so every
+    kind keeps a chance, the mood only tilts it), with that kind's tracks."""
+    kinds = [k for k in MOODS if any(t not in bad for t in songs.get(k, ()))]
+    if not kinds:
+        return None, []
+    kind = rng.choices(kinds, [MOOD_MIX[mood][k] for k in kinds])[0]
+    return kind, [t for t in songs[kind] if t not in bad]
 
 
 def next_track(slot, tracks, rng=random):
@@ -2234,6 +2241,7 @@ def run_ui():
              'volume': None}
     usage = {}  # provider -> (lowest percent left, limit reached), kept by update_gauges for the music
     playlists = {}  # (avatar, kind) -> {'track', 'pos', 'bag'}: where each character's music left off
+    drawn = {}  # avatar -> the kind its current track was drawn from, kept until that track ends
     players = {'chime': next(filter(None, map(shutil.which, ('pw-play', 'aplay', 'ffplay'))), None),
                'theme': shutil.which('ffplay')}
     def sound_on():
@@ -2304,6 +2312,7 @@ def run_ui():
                 if slot['pos'] == 0 and now - sound['since'] < 2:
                     sound['bad'].add(slot['track'])  # not retried until the monitor restarts
                 slot['track'] = None  # the next start takes the next track in the bag
+                drawn.pop(sound['key'][0], None)  # and draws its kind afresh
             sound.update(proc=None, key=None)
         # Ready after a battle-length turn plays the character's victory fanfare; otherwise chimes mark
         # chats that finished, need input, or failed.
@@ -2342,7 +2351,12 @@ def run_ui():
             if not (music and music_started(row, now, cfg_now)):
                 continue
             mood = sound['moods'].get('openai' if row.get('provider') == 'codex' else 'anthropic', 'field')
-            kind, tracks = mood_tracks(music.get(row['avatar'], {}), mood, sound['bad'])
+            songs = music.get(row['avatar'], {})
+            kind = drawn.get(row['avatar'])
+            tracks = [t for t in songs.get(kind, ()) if t not in sound['bad']]
+            if not tracks:
+                kind, tracks = mood_tracks(songs, mood, sound['bad'])
+                drawn[row['avatar']] = kind
             if tracks:
                 keys[row['id']] = ((row['avatar'], kind), tracks)
         target = pick_theme(rows, sound['theme'], keys, now, sound['picked']) if on and now >= sound['hold'] else None
