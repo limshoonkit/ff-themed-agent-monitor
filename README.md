@@ -19,6 +19,8 @@ Codex chats can be detected from their local rollout metadata before hooks are t
 
 Tool states recognize Codex's dotted and MCP names. File and web reads use Reading; planning and waiting for tool output use Thinking; agent calls use Delegating; user questions use Needs input; edits, image generation and other commands use Working. For `exec` wrappers, the monitor briefly inspects explicit nested tool names and simple read-only shell commands such as `rg`, `cat` and `git diff`. Mixed or ambiguous commands stay Working. Only the resolved tool name is retained, never the supplied code or command arguments; long MCP prefixes are removed from the card label.
 
+Claude cards recover from a missed compaction completion hook: if Claude reports Idle and both hooks and transcript writes have been quiet for five minutes, the card falls back to `Idle · detected`. This estimate is saved across monitor restarts; the next hook restores live tracking. A compaction that runs silently longer than the grace period can also trigger this estimate. Set `"compact_stale_after": 600` in the monitor's `config.json` for a longer grace period (seconds), or `0` to disable this fallback. Busy reports, recent activity and missing transcripts prevent the fallback.
+
 ## Requirements
 
 Linux, Python 3, Tkinter, and Pillow. The GUI needs a desktop display. The Claude Code and Codex integrations use local session files and lifecycle hooks; install only the integration you use.

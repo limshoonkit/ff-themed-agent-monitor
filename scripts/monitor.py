@@ -317,7 +317,9 @@ def tool_state(name, tool_input=None):
 
 def state_for(event, payload, previous='idle'):
     if event == 'SessionStart':
-        return previous if payload.get('source') == 'compact' else 'idle'
+        if payload.get('source') == 'compact':
+            return 'thinking' if previous == 'compacting' else previous
+        return 'idle'
     if event in ('PermissionRequest', 'Elicitation'):
         return 'waiting'
     if event == 'Notification':
@@ -560,6 +562,23 @@ def record(payload, owner=None, provider='claude'):
         save(db, row)
 
 
+def recover_stale_compaction(row, now, cfg):
+    """Fallback for a Claude session reporting idle after a lost compaction completion hook.
+    Called only with explicit idle metadata. Both hooks and transcript writes renew the grace period;
+    the result is an estimate, so mark it as metadata rather than inventing a completion hook."""
+    timeout = setting(cfg, 'compact_stale_after')
+    if row['state'] != 'compacting' or not timeout or not row.get('transcript'):
+        return
+    try:
+        last_activity = max(row.get('updated') or 0, Path(row['transcript']).stat().st_mtime)
+    except OSError:
+        return  # Without a readable transcript we cannot establish that it has gone quiet.
+    if now - last_activity < timeout:
+        return
+    end_turn(row, last_activity)
+    row.update(state='idle', source='metadata', updated=last_activity, flash=None, flash_until=None)
+
+
 def refresh_sessions():
     """Best-effort bootstrap from metadata, without reading any transcripts."""
     now = time.time()
@@ -588,7 +607,8 @@ def refresh_sessions():
                     fixed = dict(row, state=state, updated=min(stamp, now))
                     end_turn(fixed, fixed['updated'])
                     save(db, fixed)
-        names = list(config()['avatars'])
+        cfg = config()
+        names = list(cfg['avatars'])
         for path in sorted((CLAUDE / 'sessions').glob('*.json')):
             try:
                 m = json.loads(path.read_text())
@@ -611,7 +631,9 @@ def refresh_sessions():
                     row.update(cwd=m.get('cwd', ''), pid=pid, proc_start=start, state=state, updated=stamp,
                                source='metadata', avatar=names[n % len(names)], created=now)
                 elif old['source'] == 'metadata':
-                    row.update(state=state, updated=stamp, pid=pid, proc_start=start)
+                    row.update(pid=pid, proc_start=start)
+                    if stamp >= old['updated']:
+                        row.update(state=state, updated=stamp)
                 elif not old['pid']:
                     row.update(pid=pid, proc_start=start)
                 elif old['state'] in BUSY and state == 'idle' and stamp > old['updated']:
@@ -619,6 +641,8 @@ def refresh_sessions():
                     # idle metadata can clear busy states, but never clears an alert.
                     row.update(state='idle', updated=stamp, source='metadata')
                     end_turn(row, stamp)
+                if m.get('status') == 'idle':
+                    recover_stale_compaction(row, now, cfg)
                 row.update(started=started or row['started'] or row['created'], name=label,
                            cwd=m.get('cwd') or row['cwd'])
                 if dict(old or {}) != row:
@@ -1791,7 +1815,8 @@ MUSIC_DEFAULTS = {'music_delay': 5, 'victory_after': 30, 'victory_seconds': 7,
 HEALTH_DEFAULTS = {'context_warn': 40, 'context_bad': 70, 'tokens_warn': 150_000, 'tokens_bad': 300_000,
                    'cache_ttl': 300, 'cold_tokens': 50_000, 'struggle_errors': 3,
                    'long_turn': 1200, 'long_turn_tools': 40}
-SETTINGS = {**MUSIC_DEFAULTS, **HEALTH_DEFAULTS}
+RECOVERY_DEFAULTS = {'compact_stale_after': 300}  # quiet seconds before falling back to Claude's idle report
+SETTINGS = {**MUSIC_DEFAULTS, **HEALTH_DEFAULTS, **RECOVERY_DEFAULTS}
 MOOD_MARGIN = 5  # points past a threshold before the mood changes, so estimates can't make it flicker
 WINDOW_SECONDS = {'five_hour': 5 * 3600, 'seven_day': 7 * 86400}
 BURN_SPAN = 1800  # the short window's pace comes from the last half hour of use
