@@ -1,7 +1,16 @@
 {
   "working": [
     "bomb-combo",
-    "cactuar-combo"
+    "cactuar-combo",
+    "dolphin-sweeper"
+  ],
+  "thinking": [
+    "running",
+    "materia-study"
+  ],
+  "reading": [
+    "materia-study",
+    "running"
   ],
   "background": [
     "piano",

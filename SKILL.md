@@ -23,13 +23,17 @@ One card represents one open interactive Claude Code session; idle/completed ses
 
 The following are default mappings. An avatar's optional `animations.json` overrides them with ordered GIF basename choices. The first existing file wins; missing scenes fall back to idle. All three use neutral default idle poses, also used by the picker thumbnails. Tifa plays piano during background waiting, studies materia while reading, and fights Bomb/Cactuar during execution. Rinoa pets Angelo during background waiting, reads a briefing while thinking, and fights Bomb/Bite Bug during execution. Yuna plays with a Moogle during background waiting, prays while thinking, and uses Valefor/Water Flan scenes during execution; delegation uses Valefor. Rinoa/Yuna have separate waiting and hurt poses. For Tifa, thinking/compacting use chin-rest thinking (historically named `running.gif`); delegation/needs-input use guard; ready uses her neutral standing pose; failures use hurt. This removes generic running, full-turn scanning, jumping, and repeated waving. Tifa victory scene remains pending. Optional `variants.json` lists `working` and `background` scene basenames. Working encounters rotate every 8–14 seconds; quiet background variants every 25–45 seconds, without immediate repeats. Idle/picker, approval and error poses stay fixed. Local background variants include Tifa at Seventh Heaven, Rinoa fetching with Angelo and Yuna embracing Valefor. Lightning may name a `busy_shift` GIF: it plays once on a change between busy roles, at most every 30 seconds, and yields immediately to alerts or an avatar change. All sprites and picker thumbnails use a common 4:3 transparent canvas, preserving source proportions without stretching. Adding variants to an already-loaded avatar needs a monitor restart.
 
+The local working rotation also includes `dolphin-sweeper` (Tifa's Dolphin Blow versus a Sweeper), `angel-wing-trexaur` (Rinoa's Angel Wing and Meteor versus a T-Rexaur), `shiva-bomb` (Yuna and Shiva's Diamond Dust versus a Bomb), and `army-of-one-behemoth` (Lightning's Army of One versus a Behemoth King). These are six-frame transparent loops alongside the existing encounters. Source sheets and exact built-in image generation prompts stay local in `artwork/<character>/`; GIFs stay in `assets/<character>/`, all excluded from Git.
+
+Codex tool mapping recognizes dotted and MCP namespaces, user questions, agent lifecycle tools, planning calls and tool-output waits. `exec` wrappers are classified from explicit nested tool calls and simple read-only shell commands; mixed/ambiguous commands remain Working. Tool input is inspected transiently and never retained; only resolved tool names and counts are saved. Cards show the action without a long MCP prefix. Optional `thinking`/`reading` variants rotate every 12–20 seconds and `delegating` variants every 10–16 seconds. Tifa alternates thought and materia study; Yuna alternates Valefor and Shiva delegation scenes. Idle, Needs input and Error remain fixed.
+
 | State | Trigger | Default animation |
 |---|---|---|
 | Idle | session start, interrupt | `idle` |
 | Thinking | prompt submitted, between tools, after compaction | `review` |
 | Reading | Read/Grep/Glob/LS/WebFetch/WebSearch and similar read-only tools | `review` |
-| Working | Edit/Write/Bash/MCP and other tools (card shows the tool name) | `running` |
-| Delegating | Agent/Task tool, subagent activity (shows active subagent count) | `running-right` |
+| Working | edits, image generation, other or ambiguous commands (card shows the tool name) | `running` |
+| Delegating | Agent/Task/spawn/send/wait-agent tools, subagent activity (shows active subagent count) | `running-right` |
 | Compacting | `PreCompact` until `PostCompact` | `idle-jump-idle` |
 | Needs input | permission prompt, elicitation, AskUserQuestion, ExitPlanMode | `waiting` |
 | Background ×N | stopped/idle while background Bash, Monitor, or subagents still run | `look-loop` |

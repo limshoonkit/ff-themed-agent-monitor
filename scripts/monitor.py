@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 from datetime import datetime
 import fcntl
@@ -55,12 +56,17 @@ COLORS = {'idle': '#a6b0c3', 'thinking': '#b9a8ff', 'reading': '#7fd4e8', 'worki
           'delegating': '#9fc2ff', 'compacting': '#d6b8ff', 'waiting': '#ffcf70',
           'ready': '#84e0bb', 'background': '#9fd3c7', 'failed': '#ff919b'}
 CARD_BACKDROPS = {'field': '#1e3035', 'battle': '#332d36', 'boss': '#382733'}
-SCENE_INTERVALS = {'working': (8, 14), 'background': (25, 45)}
+SCENE_INTERVALS = {'working': (8, 14), 'thinking': (12, 20), 'reading': (12, 20),
+                   'delegating': (10, 16), 'background': (25, 45)}
 BUSY = {'thinking', 'reading', 'working', 'delegating', 'compacting'}
 READ_TOOLS = {'Read', 'Grep', 'Glob', 'LS', 'WebFetch', 'WebSearch', 'NotebookRead', 'ToolSearch',
-              'TaskList', 'TaskGet', 'TaskOutput', 'ListMcpResourcesTool', 'ReadMcpResourceTool'}
-AGENT_TOOLS = {'Agent', 'Task'}
-WAIT_TOOLS = {'AskUserQuestion', 'ExitPlanMode'}
+              'TaskList', 'TaskGet', 'TaskOutput', 'ListMcpResourcesTool', 'ReadMcpResourceTool',
+              # Codex's own spellings
+              'web_search', 'web.run', 'view_image', 'read_file', 'list_dir', 'grep_files', 'search_tool_bm25'}
+AGENT_TOOLS = {'Agent', 'Task', 'spawn_agent', 'followup_task', 'send_message', 'wait_agent',
+               'interrupt_agent', 'resume_agent', 'close_agent'}
+WAIT_TOOLS = {'AskUserQuestion', 'ExitPlanMode', 'request_user_input', 'request_user_input_async'}
+THINK_TOOLS = {'update_plan', 'create_goal', 'update_goal', 'enter_plan_mode', 'wait', 'sleep'}
 JOB_TOOLS = {'Monitor'}  # always background; other tools count only with run_in_background
 JOB_TTL = 12 * 3600  # forget a background job whose completion notice never appears
 NOTICE = re.compile(rb'<tool-use-id>([A-Za-z0-9_-]{1,100})</tool-use-id>.*?<status>([a-z_]{1,20})</status>', re.S)
@@ -185,14 +191,128 @@ def agent_parent(prefix='claude'):
     return None, None
 
 
-def tool_state(name):
-    if name in WAIT_TOOLS:
-        return 'waiting'
-    if name in AGENT_TOOLS:
-        return 'delegating'
-    if name in READ_TOOLS:
-        return 'reading'
-    return 'working'
+def tool_leaf(name):
+    """Keep the action visible instead of truncating a long MCP server prefix."""
+    return re.split(r'__|\.', name)[-1] if isinstance(name, str) else ''
+
+
+def tool_key(name):
+    return re.sub(r'[^a-z0-9]', '', tool_leaf(name).lower())
+
+
+def tool_label(name):
+    return 'web.run' if name in ('web.run', 'web__run') else tool_leaf(name)
+
+
+TOOL_STATES = {tool_key(name): state for names, state in (
+    (READ_TOOLS, 'reading'), (AGENT_TOOLS, 'delegating'), (WAIT_TOOLS, 'waiting'),
+    (THINK_TOOLS, 'thinking')) for name in names}
+TOOL_STATES.update({name: 'reading' for name in ('search', 'currtime', 'currenttime')})
+JOB_TOOL_KEYS = {tool_key(name) for name in JOB_TOOLS}
+COMMAND_TOOLS = {'bash', 'shell', 'execcommand', 'shellcommand'}
+# Skip comments and string literals so examples inside a prompt are not counted as calls.
+SCRIPT_CALLS = re.compile(r'''/\*[\s\S]*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|(?P<dynamic>\btools\s*\[)|\btools\.(?P<name>[A-Za-z_][A-Za-z_0-9]*)\s*\(''')
+COMMAND_LITERAL = re.compile(r'''\s*\{\s*(?:cmd|command|"cmd"|"command"|'cmd'|'command')\s*:\s*(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''')
+
+
+def shell_reader(command):
+    """Recognize simple read-only command chains; ambiguous shell code stays Working."""
+    if not isinstance(command, str) or any(c in command for c in ('$', '`', '>', '<', '(', ')', '\\', '\n')):
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|')
+        lexer.whitespace_split = True
+        parts, labels = [], []
+        for token in lexer:
+            if token in ('&&', '||', '|', ';'):
+                if not parts:
+                    return None
+                labels.append(parts)
+                parts = []
+            elif token == '&':
+                return None
+            else:
+                parts.append(token)
+        if parts:
+            labels.append(parts)
+        if not labels:
+            return None
+        names = []
+        for args in labels:
+            command_name = Path(args[0]).name
+            if command_name == 'git':
+                if len(args) < 2 or args[1] not in ('status', 'diff', 'show', 'log', 'ls-files', 'ls-tree', 'rev-parse'):
+                    return None
+                if any(a.startswith(('--output', '--ext-diff', '--textconv')) for a in args[2:]):
+                    return None
+                names.append('git ' + args[1])
+            elif command_name in ('cat', 'ls', 'pwd', 'rg', 'grep', 'head', 'tail', 'wc', 'stat',
+                                   'readlink', 'file', 'du', 'which', 'sed'):
+                if any(a.startswith(('--pre', '--hostname-bin')) for a in args[1:]):
+                    return None
+                if command_name == 'sed':
+                    if len(args) < 3 or args[1] != '-n' or not re.fullmatch(r'\d+(?:,\d+)?p', args[2]):
+                        return None
+                    if any(a.startswith('-') and a != '--' for a in args[3:]):
+                        return None
+                names.append(command_name)
+            else:
+                return None
+        return names[0] if len(set(names)) == 1 else 'read commands'
+    except ValueError:
+        return None
+
+
+def tool_activity(name, tool_input=None, wrapped=False):
+    """Classify names and static wrapper calls; retain only the resolved tool name, never code."""
+    leaf, key = tool_leaf(name), tool_key(name)
+    if isinstance(tool_input, str) and len(tool_input) <= 65536 and tool_input.lstrip().startswith('{'):
+        try:
+            decoded = json.loads(tool_input)
+            if isinstance(decoded, dict):
+                tool_input = decoded
+        except ValueError:
+            pass
+    args = tool_input if isinstance(tool_input, dict) else {}
+    if key in COMMAND_TOOLS:
+        reader = shell_reader(args.get('cmd', args.get('command')))
+        return ('reading', reader) if reader else ('working', leaf)
+    if key == 'exec' and not wrapped:
+        source = tool_input if isinstance(tool_input, str) else next(
+            (args[k] for k in ('code', 'script', 'input') if isinstance(args.get(k), str)), '')
+        if len(source) > 65536:
+            return 'working', leaf
+        calls = []
+        for match in SCRIPT_CALLS.finditer(source):
+            if match.group('dynamic'):
+                calls.append(('working', leaf))
+                continue
+            nested = match.group('name')
+            if not nested:
+                continue
+            nested_args = None
+            literal = COMMAND_LITERAL.match(source, match.end()) if tool_key(nested) in COMMAND_TOOLS else None
+            if literal:
+                try:
+                    nested_args = {'cmd': ast.literal_eval(literal.group('value'))}
+                except (ValueError, SyntaxError):
+                    pass
+            calls.append(tool_activity(nested, nested_args, wrapped=True))
+        if calls:
+            priority = {'waiting': 5, 'delegating': 4, 'working': 3, 'reading': 2, 'thinking': 1}
+            return max(calls, key=lambda call: priority[call[0]])
+    if name in ('web.run', 'web__run'):
+        return 'reading', 'web.run'
+    if key in TOOL_STATES:
+        return TOOL_STATES[key], leaf
+    # Connector getters and searches commonly have a namespace and snake_case action.
+    if re.match(r'^(?:get|list|read|search|fetch|inspect|find|view|query)_', leaf):
+        return 'reading', leaf
+    return 'working', leaf
+
+
+def tool_state(name, tool_input=None):
+    return tool_activity(name, tool_input)[0]
 
 
 def state_for(event, payload, previous='idle'):
@@ -224,7 +344,7 @@ def state_for(event, payload, previous='idle'):
             return 'delegating' if previous in BUSY or previous == 'waiting' else previous
         return previous
     if event == 'PreToolUse':
-        return tool_state(payload.get('tool_name'))
+        return tool_state(payload.get('tool_name'), payload.get('tool_input'))
     if event in ('UserPromptSubmit', 'PostToolUse', 'PostToolUseFailure', 'ElicitationResult',
                  'PermissionDenied', 'PostCompact'):
         return 'thinking'
@@ -254,10 +374,11 @@ def apply(row, event, payload, now):
         row['turn_tools'] = (row.get('turn_tools') or 0) + 1
         name = payload.get('tool_name')
         if not sub and isinstance(name, str):
-            row['tool'] = name[:60]
+            row['tool'] = tool_activity(name, payload.get('tool_input'))[1][:60]
         args = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
-        # Only the boolean flag is inspected; background agents are tracked by SubagentStart.
-        if not sub and use_id and name not in AGENT_TOOLS and (name in JOB_TOOLS or args.get('run_in_background') is True):
+        # Background tracking reads only the boolean flag; agents use SubagentStart.
+        if not sub and use_id and tool_state(name) != 'delegating' and (
+                tool_key(name) in JOB_TOOL_KEYS or args.get('run_in_background') is True):
             jobs[use_id[:100]] = now
     elif event == 'PostToolUseFailure' and not payload.get('is_interrupt'):
         row['tool_errors'] = (row.get('tool_errors') or 0) + 1
@@ -386,6 +507,14 @@ def codex_turn_state(path):
     return _codex_turns[path][2:]
 
 
+def codex_progressed(path, since):
+    """True when the rollout was appended to well after `since`: the turn moved on by itself."""
+    try:
+        return os.stat(path).st_mtime > since + 3
+    except OSError:
+        return False
+
+
 def record(payload, owner=None, provider='claude'):
     sid = payload.get('session_id')
     event = payload.get('hook_event_name')
@@ -446,6 +575,12 @@ def refresh_sessions():
                     codex and not still_loaded and row['state'] in ('idle', 'ready', 'failed')
                     and now - row['updated'] > CODEX_IDLE):
                 db.execute('DELETE FROM sessions WHERE id=?', (row['id'],))
+            elif codex and row['state'] == 'waiting' and row['transcript'] and row['source'] == 'hook' and (
+                    codex_progressed(row['transcript'], row['updated'])):
+                # Codex fires PermissionRequest even when a rule or auto-review approves the call and may send
+                # no hook after it; a rollout written to since the request means nobody is being asked.
+                fixed = dict(row, state='thinking', waiters='[]', updated=now)
+                save(db, fixed)
             elif codex and not still_loaded and row['state'] in BUSY:
                 # Not held open (e.g. the VS Code extension's chats): the rollout still shows a missed Stop.
                 state, stamp = codex_turn_state(row['transcript'])
@@ -1090,7 +1225,7 @@ def animation(row, now):
 def status_text(row):
     text = LABELS.get(row['state'], row['state'])
     if row['state'] in ('reading', 'working') and row.get('tool'):
-        text += ' · ' + row['tool'].removeprefix('mcp__')[:18]
+        text += ' · ' + tool_label(row['tool'])[:18]
     agents = len(json.loads(row.get('subagents') or '{}'))
     if agents and row['state'] == 'delegating':
         text += f' ×{agents}'
@@ -1530,7 +1665,7 @@ def variant_paths(directory, anim):
 
 
 def scene_paths(directory, anim):
-    """Rotate execution and quiet background scenes; keep alerts and idle predictable."""
+    """Rotate scenes within their activity; keep alerts and idle predictable."""
     paths = [gif_for(directory, anim)]
     if anim in SCENE_INTERVALS:
         paths.extend(p for p in variant_paths(directory, anim) if p not in paths)

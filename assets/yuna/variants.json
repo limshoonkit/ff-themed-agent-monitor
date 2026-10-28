@@ -1,7 +1,12 @@
 {
   "working": [
     "valefor",
-    "water-flan"
+    "water-flan",
+    "shiva-bomb"
+  ],
+  "delegating": [
+    "valefor",
+    "shiva-bomb"
   ],
   "background": [
     "moogle",

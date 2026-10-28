@@ -17,6 +17,8 @@ The preview is recorded from the real window, using placeholder chats, a placeho
 
 Codex chats can be detected from their local rollout metadata before hooks are trusted. Detailed Codex tool and permission states require approving the configured hooks in Codex's **Hooks need review** prompt or `/hooks`.
 
+Tool states recognize Codex's dotted and MCP names. File and web reads use Reading; planning and waiting for tool output use Thinking; agent calls use Delegating; user questions use Needs input; edits, image generation and other commands use Working. For `exec` wrappers, the monitor briefly inspects explicit nested tool names and simple read-only shell commands such as `rg`, `cat` and `git diff`. Mixed or ambiguous commands stay Working. Only the resolved tool name is retained, never the supplied code or command arguments; long MCP prefixes are removed from the card label.
+
 ## Requirements
 
 Linux, Python 3, Tkinter, and Pillow. The GUI needs a desktop display. The Claude Code and Codex integrations use local session files and lifecycle hooks; install only the integration you use.
@@ -64,7 +66,18 @@ Copy your GIFs into `assets/<name>/` or register a separate local folder:
 python3 scripts/monitor.py add-avatar "My Avatar" /absolute/path/to/gifs
 ```
 
-Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes (8–14 seconds per scene) and quiet background scenes (25–45 seconds). Idle and approval/error poses stay consistent. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. The local set is Tifa, Rinoa, Yuna and Lightning.
+Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes (8–14 seconds per scene), thinking/reading scenes (12–20 seconds), delegation scenes (10–16 seconds), and quiet background scenes (25–45 seconds). Tifa alternates thoughtful and materia-study poses for thinking/reading; Yuna alternates Valefor and Shiva scenes for delegation. Idle and approval/error poses stay consistent. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. The local set is Tifa, Rinoa, Yuna and Lightning.
+
+The local working rotation also includes these six-frame combat loops:
+
+| Character | Scene | GIF basename |
+|---|---|---|
+| Tifa — FFVII | Dolphin Blow against a Sweeper | `dolphin-sweeper` |
+| Rinoa — FFVIII | Angel Wing and Meteor against a T-Rexaur | `angel-wing-trexaur` |
+| Yuna — FFX | Shiva's Diamond Dust against a Bomb, with Yuna beside her | `shiva-bomb` |
+| Lightning — FFXIII | Army of One against a Behemoth King | `army-of-one-behemoth` |
+
+These scenes rotate alongside the existing encounters. Their GIFs, source sheets and generation prompts stay local under `assets/<name>/` and `artwork/<name>/`; they are excluded from Git. Restart the monitor after adding scenes to a loaded avatar.
 
 Local background variants include Tifa at a Seventh Heaven drinks counter, Rinoa playing fetch with Angelo, and Yuna embracing Valefor. Lightning's optional `busy_shift` scene plays once when her busy role changes, at most every 30 seconds, then returns to the activity animation. Input requests and errors interrupt it immediately.
 
