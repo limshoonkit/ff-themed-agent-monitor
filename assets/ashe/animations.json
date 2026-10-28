@@ -1,0 +1,13 @@
+{
+  "idle": ["idle"],
+  "thinking": ["gambits"],
+  "reading": ["license-board"],
+  "working": ["sword-of-kings"],
+  "delegating": ["belias"],
+  "compacting": ["license-board"],
+  "waiting": ["idle"],
+  "background": ["magicite"],
+  "ready": ["idle"],
+  "celebrate": ["idle"],
+  "failed": ["hurt"]
+}

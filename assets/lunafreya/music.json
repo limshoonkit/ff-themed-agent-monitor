@@ -1,0 +1,22 @@
+{
+  "field": [
+    "LUNA.mp3",
+    "Main Theme.mp3",
+    "Somnus.mp3",
+    "Sunset Waltz.mp3",
+    "Valse di Fantastica.mp3",
+    "Veiled in Black.mp3"
+  ],
+  "battle": [
+    "The Fight Is On.mp3",
+    "Magna Insomnia.mp3"
+  ],
+  "boss": [
+    "APOCALYPSIS NOCTIS.mp3",
+    "OMNIS LACRIMA.mp3"
+  ],
+  "victory": [
+    "Victory Fanfare.mp3"
+  ],
+  "victory_seconds": 7
+}

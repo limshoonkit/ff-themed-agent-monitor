@@ -1,0 +1,13 @@
+{
+  "idle": ["idle"],
+  "thinking": ["oracle-prayer"],
+  "reading": ["notebook"],
+  "working": ["trident-blessing"],
+  "delegating": ["leviathan"],
+  "compacting": ["notebook"],
+  "waiting": ["idle"],
+  "background": ["umbra-pryna"],
+  "ready": ["sylleblossom"],
+  "celebrate": ["sylleblossom"],
+  "failed": ["starscourge-weary"]
+}

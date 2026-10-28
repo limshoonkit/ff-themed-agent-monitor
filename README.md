@@ -2,9 +2,9 @@
 
 A small Linux desktop window that shows one animated card per active Claude Code or Codex chat. Cards appear and disappear with sessions, show what the agent is doing, and can use a different avatar for each chat. Ordinary playback uses local GIFs and does not call a model.
 
-![The monitor window: usage bars for Anthropic and OpenAI, six chat cards changing state, the help panel, and the avatar picker](docs/demo.gif)
+![The monitor window: Tifa, Rinoa, Yuna, Lightning, Ashe and Lunafreya showing their current animation variants, usage bars, help and the avatar picker](docs/demo.gif)
 
-The preview is recorded from the real window, using placeholder chats, a placeholder account and made-up usage numbers. It shows six chats changing state, the `?` help panel, and a chat switching to a different avatar in the picker. The sprite GIFs, source sheets and MP3 themes are excluded from this repository; supply your own assets before running the window.
+The preview is recorded from the real window, using placeholder chats, a placeholder account and made-up usage numbers. It shows Tifa, Rinoa, Yuna, Lightning, Ashe and Lunafreya cycling through every currently mapped scene, including the new combat encounters and quiet variants, followed by the `?` help panel and avatar picker. The sprite GIFs, source sheets and MP3 themes are excluded from this repository; supply your own assets before running the window.
 
 ## What it shows
 
@@ -68,7 +68,7 @@ Copy your GIFs into `assets/<name>/` or register a separate local folder:
 python3 scripts/monitor.py add-avatar "My Avatar" /absolute/path/to/gifs
 ```
 
-Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes (8–14 seconds per scene), thinking/reading scenes (12–20 seconds), delegation scenes (10–16 seconds), and quiet background scenes (25–45 seconds). Tifa alternates thoughtful and materia-study poses for thinking/reading; Yuna alternates Valefor and Shiva scenes for delegation. Idle and approval/error poses stay consistent. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. The local set is Tifa, Rinoa, Yuna and Lightning.
+Each avatar needs the five base GIFs listed in [assets/README.md](assets/README.md), or a complete `animations.json` mapping. `variants.json` may list extra working scenes (8–14 seconds per scene), thinking/reading scenes (12–20 seconds), delegation scenes (10–16 seconds), and quiet background scenes (25–45 seconds). Tifa alternates thoughtful and materia-study poses for thinking/reading; Yuna alternates Valefor and Shiva scenes for delegation. Idle and approval/error poses stay consistent. The personal development sprites are ignored by Git; a fresh clone needs its own local GIF assets. The local set is Tifa, Rinoa, Yuna, Lightning, Ashe and Lunafreya.
 
 The local working rotation also includes these six-frame combat loops:
 
@@ -78,6 +78,7 @@ The local working rotation also includes these six-frame combat loops:
 | Rinoa — FFVIII | Angel Wing and Meteor against a T-Rexaur | `angel-wing-trexaur` |
 | Yuna — FFX | Shiva's Diamond Dust against a Bomb, with Yuna beside her | `shiva-bomb` |
 | Lightning — FFXIII | Army of One against a Behemoth King | `army-of-one-behemoth` |
+| Ashe — FFXII | Sword of Kings against Rogue Tomato | `rogue-tomato` |
 
 These scenes rotate alongside the existing encounters. Their GIFs, source sheets and generation prompts stay local under `assets/<name>/` and `artwork/<name>/`; they are excluded from Git. Restart the monitor after adding scenes to a loaded avatar.
 

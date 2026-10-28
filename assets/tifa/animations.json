@@ -14,14 +14,13 @@
     "waiting"
   ],
   "delegating": [
-    "battle-stance",
+    "running-right",
     "waiting"
   ],
   "compacting": [
     "running"
   ],
   "waiting": [
-    "battle-stance",
     "waiting"
   ],
   "background": [
@@ -29,15 +28,14 @@
     "idle"
   ],
   "ready": [
-    "victory",
+    "waving",
     "idle"
   ],
   "celebrate": [
-    "victory",
-    "idle"
+    "jumping",
+    "waving"
   ],
   "failed": [
-    "hurt",
     "failed"
   ]
 }

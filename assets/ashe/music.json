@@ -1,0 +1,20 @@
+{
+  "field": [
+    "main_theme.mp3",
+    "Streets of Rabanastre.mp3",
+    "rabanastre upper.mp3",
+    "Cerobi Steppe.mp3",
+    "The Dalmasca Estersand.mp3",
+    "secret practice.mp3"
+  ],
+  "battle": [
+    "The Battle For Freedom.mp3",
+    "Theme of the Empire.mp3"
+  ],
+  "boss": [
+    "boss fight.mp3"
+  ],
+  "victory": [
+    "Victory fanfare.mp3"
+  ]
+}

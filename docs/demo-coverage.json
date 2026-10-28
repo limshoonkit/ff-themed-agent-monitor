@@ -1,0 +1,242 @@
+{
+  "avatars": {
+    "Tifa": [
+      {
+        "state": "working",
+        "scene": "dolphin-sweeper"
+      },
+      {
+        "state": "working",
+        "scene": "cactuar-combo"
+      },
+      {
+        "state": "working",
+        "scene": "bomb-combo"
+      },
+      {
+        "state": "background",
+        "scene": "piano"
+      },
+      {
+        "state": "background",
+        "scene": "seventh-heaven"
+      },
+      {
+        "state": "thinking",
+        "scene": "running"
+      },
+      {
+        "state": "thinking",
+        "scene": "materia-study"
+      },
+      {
+        "state": "delegating",
+        "scene": "running-right"
+      },
+      {
+        "state": "idle",
+        "scene": "idle"
+      },
+      {
+        "state": "waiting",
+        "scene": "waiting"
+      },
+      {
+        "state": "failed",
+        "scene": "failed"
+      },
+      {
+        "state": "ready",
+        "scene": "waving"
+      },
+      {
+        "state": "celebrate",
+        "scene": "jumping"
+      }
+    ],
+    "Rinoa": [
+      {
+        "state": "working",
+        "scene": "angel-wing-trexaur"
+      },
+      {
+        "state": "working",
+        "scene": "bite-bug"
+      },
+      {
+        "state": "working",
+        "scene": "blaster-bomb"
+      },
+      {
+        "state": "background",
+        "scene": "angelo"
+      },
+      {
+        "state": "background",
+        "scene": "angelo-fetch"
+      },
+      {
+        "state": "thinking",
+        "scene": "briefing"
+      },
+      {
+        "state": "delegating",
+        "scene": "await-command"
+      },
+      {
+        "state": "failed",
+        "scene": "hurt"
+      }
+    ],
+    "Yuna": [
+      {
+        "state": "working",
+        "scene": "shiva-bomb"
+      },
+      {
+        "state": "working",
+        "scene": "water-flan"
+      },
+      {
+        "state": "working",
+        "scene": "valefor"
+      },
+      {
+        "state": "background",
+        "scene": "moogle"
+      },
+      {
+        "state": "background",
+        "scene": "valefor-embrace"
+      },
+      {
+        "state": "thinking",
+        "scene": "prayer"
+      },
+      {
+        "state": "idle",
+        "scene": "await-command"
+      },
+      {
+        "state": "failed",
+        "scene": "hurt"
+      }
+    ],
+    "Lightning": [
+      {
+        "state": "working",
+        "scene": "army-of-one-behemoth"
+      },
+      {
+        "state": "working",
+        "scene": "odin"
+      },
+      {
+        "state": "working",
+        "scene": "psicom"
+      },
+      {
+        "state": "background",
+        "scene": "maintenance"
+      },
+      {
+        "state": "thinking",
+        "scene": "datalog"
+      },
+      {
+        "state": "idle",
+        "scene": "idle"
+      },
+      {
+        "state": "failed",
+        "scene": "hurt"
+      },
+      {
+        "state": "busy_shift",
+        "scene": "paradigm-shift"
+      }
+    ],
+    "Ashe": [
+      {
+        "state": "working",
+        "scene": "rogue-tomato"
+      },
+      {
+        "state": "working",
+        "scene": "sword-of-kings"
+      },
+      {
+        "state": "background",
+        "scene": "magicite"
+      },
+      {
+        "state": "background",
+        "scene": "royal-rest"
+      },
+      {
+        "state": "thinking",
+        "scene": "gambits"
+      },
+      {
+        "state": "thinking",
+        "scene": "map"
+      },
+      {
+        "state": "reading",
+        "scene": "license-board"
+      },
+      {
+        "state": "delegating",
+        "scene": "belias"
+      },
+      {
+        "state": "idle",
+        "scene": "idle"
+      },
+      {
+        "state": "failed",
+        "scene": "hurt"
+      }
+    ],
+    "Lunafreya": [
+      {
+        "state": "working",
+        "scene": "leviathan-iron-giant"
+      },
+      {
+        "state": "working",
+        "scene": "leviathan"
+      },
+      {
+        "state": "working",
+        "scene": "trident-blessing"
+      },
+      {
+        "state": "background",
+        "scene": "umbra-pryna"
+      },
+      {
+        "state": "background",
+        "scene": "sylleblossom"
+      },
+      {
+        "state": "thinking",
+        "scene": "oracle-prayer"
+      },
+      {
+        "state": "reading",
+        "scene": "notebook"
+      },
+      {
+        "state": "idle",
+        "scene": "idle"
+      },
+      {
+        "state": "failed",
+        "scene": "starscourge-weary"
+      }
+    ]
+  },
+  "covered_scenes": 56,
+  "captured_frames": 475
+}
