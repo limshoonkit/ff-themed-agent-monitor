@@ -64,6 +64,10 @@ WAIT_TOOLS = {'AskUserQuestion', 'ExitPlanMode'}
 JOB_TOOLS = {'Monitor'}  # always background; other tools count only with run_in_background
 JOB_TTL = 12 * 3600  # forget a background job whose completion notice never appears
 NOTICE = re.compile(rb'<tool-use-id>([A-Za-z0-9_-]{1,100})</tool-use-id>.*?<status>([a-z_]{1,20})</status>', re.S)
+# A Monitor that expires or is stopped reports only its task ID, so the ID it started with is looked up.
+MONITOR_START = re.compile(r'Monitor started \(task ([A-Za-z0-9_-]{1,40})')
+MONITOR_END = re.compile(rb'<task-id>([A-Za-z0-9_-]{1,40})</task-id>(?:(?!</task-notification>).)*?'
+                         rb'<event>\[Monitor (?:expired|stopped|timed out)', re.S)
 FLASH_SECONDS = {'failed': 2.5, 'celebrate': 1.6}
 READY_WAVE = 60  # After this long, a ready card relaxes to the idle animation.
 COLUMNS = {'id': 'TEXT PRIMARY KEY', 'cwd': 'TEXT', 'pid': 'INTEGER', 'proc_start': 'TEXT',
@@ -537,7 +541,7 @@ class Usage:
     def reset(self, inode):
         self.inode, self.offset, self.messages, self.stamps = inode, 0, {}, {}
         self.model, self.context, self.peak, self.compactions = None, 0, 0, 0
-        self.finished = set()
+        self.finished, self.monitors = set(), {}  # monitors: task ID -> tool-use ID
         self.titles = {}  # 'ai-title' / 'custom-title' record -> latest title Claude Code gave the chat
 
     def update(self):
@@ -566,6 +570,19 @@ class Usage:
         if b'<task-notification>' in line:
             self.finished.update(i.decode() for i, status in NOTICE.findall(line)
                                  if status not in (b'running', b'pending', b'progress'))
+            self.finished.update(self.monitors[i.decode()] for i in MONITOR_END.findall(line)
+                                 if i.decode() in self.monitors)
+        if b'Monitor started (task' in line:
+            try:
+                for c in json.loads(line)['message']['content']:
+                    text = c.get('content') if c.get('type') == 'tool_result' else None
+                    if isinstance(text, list):
+                        text = ' '.join(t.get('text') or '' for t in text if isinstance(t, dict))
+                    match = MONITOR_START.match(text or '')
+                    if match and isinstance(c.get('tool_use_id'), str):
+                        self.monitors[match[1]] = c['tool_use_id'][:100]
+            except (ValueError, KeyError, TypeError, AttributeError):
+                pass
         if b'"type":"ai-title"' in line or b'"type":"custom-title"' in line:
             try:
                 d = json.loads(line)
@@ -1570,7 +1587,7 @@ def fit_sprite(frame, size=(168, 126)):
 
 
 THEME_EXTS = ('.ogg', '.opus', '.mp3', '.flac', '.m4a', '.wav')
-BACKGROUND_ROTATE = 120  # seconds each background-only chat's music plays before the next one's turn
+BACKGROUND_ROTATE = 120  # seconds a background-only chat's music plays at least; it hands over when a track ends
 THEME_GRACE = 3  # seconds a theme keeps playing through a pause, so back-to-back turns don't restart it
 # Original jingles in a 16-bit RPG style, not tunes from any game. Each note: (start s, Hz, ring s, wave,
 # gain, decay s); 'p25'/'p12' are pulse waves (melody), 'tri' a triangle (bass). Notes ring into each other
@@ -1608,11 +1625,11 @@ def theme_for(name, cfg):
     return None
 
 
-def pick_theme(rows, current, themes, now=0, picked=0, rotate=BACKGROUND_ROTATE):
+def pick_theme(rows, current, themes, now=0, picked=0, rotate=BACKGROUND_ROTATE, between=True):
     """Which chat's theme plays: only busy or background, unmuted chats whose character has a theme.
     Busy chats take priority. The one already playing keeps going; otherwise the chat whose turn started
-    most recently takes over. With only background chats left, the music rotates to the next one every
-    `rotate` seconds (since `picked`)."""
+    most recently takes over. With only background chats left, the music rotates to the next one at the
+    first track end (`between` tracks) once `rotate` seconds have passed since `picked`, so no track is cut."""
     live = [r for r in rows if not r.get('muted') and themes.get(r['id'])]
     eligible = [r for r in live if r['state'] in BUSY]
     if eligible:
@@ -1623,7 +1640,7 @@ def pick_theme(rows, current, themes, now=0, picked=0, rotate=BACKGROUND_ROTATE)
     eligible = [r for r in live if r['state'] == 'background']
     ids = [r['id'] for r in eligible]
     if current in ids:
-        if len(ids) > 1 and now - picked >= rotate:
+        if len(ids) > 1 and between and now - picked >= rotate:
             return ids[(ids.index(current) + 1) % len(ids)]
         return current
     best = max(eligible, key=lambda r: r.get('updated') or 0, default=None)
@@ -1855,8 +1872,13 @@ def child(command, **kwargs):
     return subprocess.Popen(command, stdin=subprocess.DEVNULL, preexec_fn=lambda: prctl(1, signal.SIGTERM), **kwargs)
 
 
+_players = []  # sound processes, kept so finished ones are reaped instead of left as zombies
+
+
 def play(command):
-    return child(command)
+    _players[:] = [p for p in _players if p.poll() is None]
+    _players.append(child(command))
+    return _players[-1]
 
 
 def run_ui():
@@ -2359,7 +2381,8 @@ def run_ui():
                 drawn[row['avatar']] = kind
             if tracks:
                 keys[row['id']] = ((row['avatar'], kind), tracks)
-        target = pick_theme(rows, sound['theme'], keys, now, sound['picked']) if on and now >= sound['hold'] else None
+        target = (pick_theme(rows, sound['theme'], keys, now, sound['picked'], between=sound['proc'] is None)
+                  if on and now >= sound['hold'] else None)
         current = next((r for r in rows if r['id'] == sound['theme']), None)
         if target == sound['theme'] and target:
             sound['seen'] = now

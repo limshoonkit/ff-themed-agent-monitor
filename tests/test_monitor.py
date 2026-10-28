@@ -18,9 +18,11 @@ def check_theme_pick():
     themes = {k: 1 for k in 'abcd'}
     bg = [row('a', 'background', 1), row('b', 'background', 2), row('c', 'idle', 3), row('d', 'failed', 4)]
     assert m.pick_theme(bg, None, themes, 100, 0) == 'b'  # idle and error chats never play
-    assert m.pick_theme(bg, 'b', themes, 100, 90) == 'b'  # not yet time to rotate
-    assert m.pick_theme(bg, 'b', themes, 100, 0) == 'a'  # rotates through background chats
-    assert m.pick_theme(bg, 'a', themes, 100, 0) == 'b'
+    turn = m.BACKGROUND_ROTATE
+    assert m.pick_theme(bg, 'b', themes, turn, 1) == 'b'  # not yet time to rotate
+    assert m.pick_theme(bg, 'b', themes, turn, 0) == 'a'  # rotates through background chats
+    assert m.pick_theme(bg, 'b', themes, turn, 0, between=False) == 'b'  # but never cuts a playing track
+    assert m.pick_theme(bg, 'a', themes, turn, 0) == 'b'
     busy = bg + [row('c', 'working', 3)]
     busy.remove(bg[2])
     assert m.pick_theme(busy, 'b', themes, 100, 0) == 'c'  # a running task preempts background music
@@ -28,8 +30,25 @@ def check_theme_pick():
     assert m.music_started(row('a', 'background'), 0, {}) and not m.music_started(row('c', 'idle'), 0, {})
 
 
+def check_monitor_expiry():
+    with tempfile.TemporaryDirectory(prefix='agent-monitor-usage-') as temp:
+        path = Path(temp) / 'chat.jsonl'
+        started = {'type': 'user', 'message': {'content': [{'tool_use_id': 'toolu_mon', 'type': 'tool_result',
+                   'content': 'Monitor started (task bmon1, expires in 30m unless the source ends first).'}]}}
+        notice = ('<task-notification>\n<task-id>{}</task-id>\n<summary>Monitor event</summary>\n'
+                  '<event>{}</event>\n</task-notification>')
+        lines = [started, {'type': 'user', 'message': {'content': notice.format('bmon1', 'ready')}}]
+        path.write_text(''.join(json.dumps(x) + '\n' for x in lines))
+        assert 'toolu_mon' not in m.Usage(path).update().finished  # an ordinary event keeps it running
+        lines.append({'type': 'user', 'message': {'content': notice.format('bmon1', '[Monitor expired after 30m '
+                      'with 1 event delivered. Re-arm it if you still need the watch.]')}})
+        path.write_text(''.join(json.dumps(x) + '\n' for x in lines))
+        assert 'toolu_mon' in m.Usage(path).update().finished
+
+
 def main():
     check_theme_pick()
+    check_monitor_expiry()
     with tempfile.TemporaryDirectory(prefix='agent-monitor-gui-') as temp:
         m.DATA = Path(temp) / 'state'
         m.save_config({'enabled': True, 'ui_scale': 1.5, 'avatars': {'Tifa': str(m.ROOT / 'assets/tifa')}})  # chats are assigned an avatar as they start
