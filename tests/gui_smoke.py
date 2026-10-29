@@ -44,7 +44,8 @@ def main():
         demos = ('demo-working', 'demo-reading', 'demo-thinking', 'demo-waiting', 'demo-ready', 'demo-failed')
         for sid in demos:
             event(sid, 'UserPromptSubmit')
-        event('demo-working', 'PreToolUse', tool_name='Bash')
+        event('demo-working', 'PreToolUse', tool_name='Bash', tool_input={'command': 'ssh gpu-box nvidia-smi'})
+        event('demo-reading', 'SubagentStart', agent_id='sub-1', agent_type='Explore')
         event('demo-reading', 'PreToolUse', tool_name='Grep')
         event('demo-waiting', 'PermissionRequest')
         event('demo-ready', 'Stop')
@@ -128,6 +129,7 @@ def main():
                     assert any(t.startswith('5h · 65% left · resets 2h') for t in texts), texts
                     assert any(t.startswith('7d · 28% left · resets 2d') for t in texts), texts
                     assert not any('no model calls' in t for t in texts), texts  # footer moved into help
+                    assert '×1' in texts and 'gpu-box' in texts, texts  # subagent and remote host badges
                     named = {str(w).rsplit('.', 1)[-1]: w for w in widgets(root)}
                     named['details'].invoke(); named['details'].invoke()  # icon toggle round-trips
                     root.after(10, check_sound)

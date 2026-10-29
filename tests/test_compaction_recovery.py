@@ -86,6 +86,25 @@ class CompactionRecoveryTests(unittest.TestCase):
         self.transcript.unlink()
         self.assertEqual(self.refresh()['state'], 'compacting')
 
+    def test_orphaned_chat_without_metadata_or_transcript_recovers_after_hook_silence(self):
+        self.metadata.unlink()
+        self.assertEqual(self.refresh()['state'], 'compacting')  # its transcript is still there
+        self.transcript.unlink()
+        row = self.refresh()
+        self.assertEqual((row['state'], row['source'], row['updated']), ('idle', 'metadata', 9_600))
+        self.assertEqual(self.refresh(), row)
+
+    def test_orphaned_chat_waits_for_grace_period_and_respects_disable(self):
+        self.metadata.unlink()
+        self.transcript.unlink()
+        self.row['updated'] = 9_800
+        self.save_row()
+        self.assertEqual(self.refresh()['state'], 'compacting')
+        self.row['updated'] = 9_600
+        self.save_row()
+        m.save_config({'avatars': {'Test': '/demo'}, 'compact_stale_after': 0})
+        self.assertEqual(self.refresh()['state'], 'compacting')
+
     def test_configurable_grace_period_and_disable(self):
         for timeout in (0, 600):
             with self.subTest(timeout=timeout):

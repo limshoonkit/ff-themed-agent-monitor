@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,7 +84,8 @@ COLUMNS = {'id': 'TEXT PRIMARY KEY', 'cwd': 'TEXT', 'pid': 'INTEGER', 'proc_star
            'prompts': 'INTEGER DEFAULT 0', 'subagents': "TEXT DEFAULT '{}'", 'flash': 'TEXT',
            'flash_until': 'REAL', 'transcript': 'TEXT', 'name': 'TEXT', 'mode': 'TEXT',
            'jobs': "TEXT DEFAULT '{}'", 'provider': 'TEXT', 'muted': 'INTEGER DEFAULT 0',
-           'waiters': "TEXT DEFAULT '[]'", 'turn_tools': 'INTEGER DEFAULT 0', 'turn_errors': 'INTEGER DEFAULT 0'}
+           'waiters': "TEXT DEFAULT '[]'", 'turn_tools': 'INTEGER DEFAULT 0', 'turn_errors': 'INTEGER DEFAULT 0',
+           'agent_info': "TEXT DEFAULT '{}'", 'hosts': "TEXT DEFAULT '{}'"}
 USAGE_KEYS = ('input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens')
 # Relative cost of each USAGE_KEYS kind; calibration against real readings absorbs the absolute scale.
 TOKEN_WEIGHTS = (1, 1.25, 0.1, 5)
@@ -146,7 +148,7 @@ def save(db, row):
 
 def blank(sid):
     return dict({c: None for c in COLUMNS}, id=sid, busy=0, tools=0, tool_errors=0, prompts=0,
-                subagents='{}', jobs='{}', waiters='[]')
+                subagents='{}', jobs='{}', waiters='[]', agent_info='{}', hosts='{}')
 
 
 def process_info(pid):
@@ -315,6 +317,129 @@ def tool_state(name, tool_input=None):
     return tool_activity(name, tool_input)[0]
 
 
+SHELL_HOSTS = {'ssh', 'mosh', 'autossh', 'scp', 'sftp', 'rsync'}  # run or copy on another machine
+NET_HOSTS = {'curl', 'wget', 'http', 'https', 'xh', 'git', 'nc', 'ncat', 'telnet', 'psql', 'mysql',
+             'redis-cli', 'mongosh'}  # reach another machine's service
+WRAPPERS = {'sudo', 'env', 'nohup', 'time', 'command', 'exec', 'timeout', 'stdbuf', 'nice'}
+SSH_VALUE_FLAGS = set('BbcDEeFIiJLlmOoPpQRSWw')  # ssh/scp options that take the next word
+LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1', '0.0.0.0', 'ip6-localhost'}
+HOST_NAME = re.compile(r'^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?|[0-9a-fA-F:]{2,39})$')
+REMOTE_PATH = re.compile(r'^(?:[^@/\s:]+@)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9._-]*):(?!//)')
+HOST_TTL = 600  # a reached host stays on the card this long after its last use
+
+
+def clean_host(host):
+    """A lowercase host name or IP, or None for loopback, this machine and anything not shaped like a host."""
+    if not isinstance(host, str):
+        return None
+    host = host.strip('[]').lower().rstrip('.')
+    if not HOST_NAME.match(host) or host in LOCAL_HOSTS or host.startswith('127.'):
+        return None
+    with contextlib.suppress(OSError):
+        if host in (os.uname().nodename.lower(), os.uname().nodename.lower().split('.')[0]):
+            return None
+    return host
+
+
+def url_host(text):
+    if not isinstance(text, str) or not re.match(r'^[a-z][a-z0-9+.-]*://', text, re.I):
+        return None
+    with contextlib.suppress(ValueError):
+        return clean_host(urllib.parse.urlsplit(text).hostname)
+    return None
+
+
+def command_hosts(command):
+    """[(host, command)] for each simple command in a shell string that targets another machine.
+    Only the host is kept, never the rest of the command; hosts hidden behind variables are missed."""
+    if isinstance(command, list):  # Codex: ['bash', '-lc', script] or a plain argv
+        command = command[-1] if len(command) == 3 and command[1] in ('-c', '-lc') else shlex.join(map(str, command))
+    if not isinstance(command, str) or len(command) > 65536:
+        return []
+    try:
+        lexer = shlex.shlex(command.replace('\n', ';'), posix=True, punctuation_chars=';&|()')
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return []
+    found, simple = [], []
+    for word in words + [';']:
+        if word and set(word) <= set(';&|()'):
+            found += simple_hosts(simple)
+            simple = []
+        else:
+            simple.append(word)
+    return list(dict.fromkeys(found))
+
+
+def simple_hosts(args):
+    wrapped = False
+    while args:  # sudo, env FOO=1, timeout 30 ... in front of the real command
+        if Path(args[0]).name in WRAPPERS or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', args[0]):
+            wrapped = True
+        elif not (wrapped and (args[0].startswith('-') or re.fullmatch(r'\d+[smhd]?', args[0]))):
+            break
+        args = args[1:]
+    if not args:
+        return []
+    name, rest = Path(args[0]).name, args[1:]
+    if name in ('ssh', 'mosh', 'autossh', 'sftp'):
+        skip = False
+        for arg in rest:
+            if skip:
+                skip = False
+            elif arg.startswith('-'):
+                skip = len(arg) == 2 and arg[1] in SSH_VALUE_FLAGS
+            else:
+                host = url_host(arg) or clean_host(arg.rsplit('@', 1)[-1].split(':')[0])
+                return [(host, name)] if host else []
+        return []
+    if name in ('scp', 'rsync'):
+        hosts = [url_host(a) or (REMOTE_PATH.match(a) and clean_host(REMOTE_PATH.match(a).group(1)))
+                 for a in rest if not a.startswith('-')]
+        return [(h, name) for h in hosts if h]
+    if name in NET_HOSTS:
+        hosts = [url_host(a) for a in rest]
+        if name == 'git':
+            hosts += [REMOTE_PATH.match(a) and clean_host(REMOTE_PATH.match(a).group(1)) for a in rest
+                      if not a.startswith('-')]
+        if name in ('nc', 'ncat', 'telnet'):
+            hosts.append(next((clean_host(a) for a in rest if not a.startswith('-')), None))
+        for flag, value in zip(rest, rest[1:] + ['']):  # psql -h db.example, mysql --host=db
+            if flag in ('-h', '--host') and name in ('psql', 'mysql', 'redis-cli'):
+                hosts.append(clean_host(value))
+            elif flag.startswith('--host='):
+                hosts.append(clean_host(flag.split('=', 1)[1]))
+        return [(h, name) for h in hosts if h]
+    return []
+
+
+def tool_hosts(name, tool_input=None):
+    """[(host, how)] for another machine this tool call reaches: the shell command used, or WebFetch."""
+    key = tool_key(name)
+    if isinstance(tool_input, str) and len(tool_input) <= 65536 and tool_input.lstrip().startswith('{'):
+        with contextlib.suppress(ValueError):
+            tool_input = json.loads(tool_input)
+    args = tool_input if isinstance(tool_input, dict) else {}
+    if key in COMMAND_TOOLS:
+        return command_hosts(args.get('cmd', args.get('command')))
+    if key == 'webfetch':
+        host = url_host(args.get('url'))
+        return [(host, 'WebFetch')] if host else []
+    if key == 'exec':
+        source = tool_input if isinstance(tool_input, str) else next(
+            (args[k] for k in ('code', 'script', 'input') if isinstance(args.get(k), str)), '')
+        found = []
+        for match in SCRIPT_CALLS.finditer(source[:65536]):
+            literal = match.group('name') and tool_key(match.group('name')) in COMMAND_TOOLS and \
+                COMMAND_LITERAL.match(source, match.end())
+            if literal:
+                with contextlib.suppress(ValueError, SyntaxError):
+                    found += command_hosts(ast.literal_eval(literal.group('value')))
+        return found
+    return []
+
+
 def state_for(event, payload, previous='idle'):
     if event == 'SessionStart':
         if payload.get('source') == 'compact':
@@ -361,10 +486,12 @@ def end_turn(row, now):
     row.update(tool=None, turn_tools=0, turn_errors=0)
 
 
-def apply(row, event, payload, now):
-    """Advance one session row for a hook event; stores names and counts, never content."""
+def apply(row, event, payload, now, track_hosts=True):
+    """Advance one session row for a hook event; stores names, hosts and counts, never content."""
     sub = payload.get('agent_id')
     agents = json.loads(row.get('subagents') or '{}')
+    info = json.loads(row.get('agent_info') or '{}')
+    hosts = json.loads(row.get('hosts') or '{}')
     jobs = json.loads(row.get('jobs') or '{}')
     use_id = payload.get('tool_use_id') if isinstance(payload.get('tool_use_id'), str) else None
     if event == 'UserPromptSubmit':
@@ -377,6 +504,12 @@ def apply(row, event, payload, now):
         name = payload.get('tool_name')
         if not sub and isinstance(name, str):
             row['tool'] = tool_activity(name, payload.get('tool_input'))[1][:60]
+        if isinstance(sub, str) and isinstance(name, str):
+            state, tool = tool_activity(name, payload.get('tool_input'))
+            info.setdefault(sub[:80], {}).update(state=state, tool=tool_label(tool)[:30])
+        if track_hosts:  # a subagent's reach counts for the chat that started it
+            for host, via in tool_hosts(name, payload.get('tool_input')):
+                hosts[host[:80]] = [now, via[:20]]
         args = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
         # Background tracking reads only the boolean flag; agents use SubagentStart.
         if not sub and use_id and tool_state(name) != 'delegating' and (
@@ -388,16 +521,23 @@ def apply(row, event, payload, now):
         row['flash'], row['flash_until'] = 'failed', now + FLASH_SECONDS['failed']
     elif event == 'SubagentStart' and isinstance(sub, str):
         agents[sub[:80]] = now
+        kind = payload.get('agent_type')
+        info[sub[:80]] = {'type': kind[:40] if isinstance(kind, str) and kind else 'agent', 'state': 'thinking'}
     elif event == 'SubagentStop' and isinstance(sub, str):
         agents.pop(sub[:80], None)
     elif event == 'Stop':
         row['flash'], row['flash_until'] = 'celebrate', now + FLASH_SECONDS['celebrate']
+    if event in ('PostToolUse', 'PostToolUseFailure') and isinstance(sub, str) and sub[:80] in info:
+        info[sub[:80]].update(state='thinking', tool=None)
     if event in ('PostToolUseFailure', 'PermissionDenied') and use_id:
         jobs.pop(use_id[:100], None)  # the launch itself failed or was refused
     if event in ('Stop', 'StopFailure', 'Interrupt') or (event == 'PostToolUseFailure' and payload.get('is_interrupt')):
         end_turn(row, now)
     # Missed SubagentStop events must not pin a card on "delegating" forever.
     row['subagents'] = json.dumps({k: v for k, v in agents.items() if now - v < 7200})
+    row['agent_info'] = json.dumps({k: v for k, v in info.items() if k in agents})
+    recent = sorted(hosts.items(), key=lambda item: -item[1][0])[:8]
+    row['hosts'] = json.dumps({k: v for k, v in recent if now - v[0] < HOST_TTL})
     row['jobs'] = json.dumps({k: v for k, v in jobs.items() if now - v < JOB_TTL})
     row['state'] = state_for(event, payload, row.get('state') or 'idle')
     # Who is waiting on the user: '' for the main thread, else a subagent's ID. Only the waiter's own
@@ -557,22 +697,29 @@ def record(payload, owner=None, provider='claude'):
         mode = payload.get('permission_mode')
         if isinstance(mode, str):
             row['mode'] = mode[:30]
-        apply(row, event, payload, now)
+        apply(row, event, payload, now, config().get('track_hosts', True) is not False)
         row.update(pid=pid, proc_start=start, updated=now, source='hook', provider=provider)
         save(db, row)
 
 
-def recover_stale_compaction(row, now, cfg):
+def recover_stale_compaction(row, now, cfg, idle_report=True):
     """Fallback for a Claude session reporting idle after a lost compaction completion hook.
-    Called only with explicit idle metadata. Both hooks and transcript writes renew the grace period;
-    the result is an estimate, so mark it as metadata rather than inventing a completion hook."""
+    Called with explicit idle metadata, or with idle_report=False for a chat Claude no longer has metadata for.
+    Both hooks and transcript writes renew the grace period; the result is an estimate, so mark it as
+    metadata rather than inventing a completion hook."""
     timeout = setting(cfg, 'compact_stale_after')
-    if row['state'] != 'compacting' or not timeout or not row.get('transcript'):
+    if row['state'] != 'compacting' or not timeout:
         return
     try:
         last_activity = max(row.get('updated') or 0, Path(row['transcript']).stat().st_mtime)
-    except OSError:
-        return  # Without a readable transcript we cannot establish that it has gone quiet.
+        if not idle_report:
+            return  # Unreported but its transcript is still there: nothing says it has stopped.
+    except (OSError, TypeError):
+        if idle_report:
+            return  # Without a readable transcript we cannot establish that it has gone quiet.
+        # Orphaned: no metadata and no transcript (the chat was closed or deleted while its process
+        # lingers), so no hook or idle report will ever arrive. Only hook silence is left to go on.
+        last_activity = row.get('updated') or 0
     if now - last_activity < timeout:
         return
     end_turn(row, last_activity)
@@ -609,6 +756,7 @@ def refresh_sessions():
                     save(db, fixed)
         cfg = config()
         names = list(cfg['avatars'])
+        reported = set()
         for path in sorted((CLAUDE / 'sessions').glob('*.json')):
             try:
                 m = json.loads(path.read_text())
@@ -617,6 +765,7 @@ def refresh_sessions():
                     continue
                 if not isinstance(sid, str) or not isinstance(m.get('cwd', ''), str):
                     continue
+                reported.add(sid)
                 if db.execute('SELECT 1 FROM ended WHERE id=?', (sid,)).fetchone():
                     continue
                 old = db.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
@@ -649,6 +798,12 @@ def refresh_sessions():
                     save(db, row)
             except (OSError, ValueError, KeyError, TypeError):
                 continue
+        for old in db.execute("SELECT * FROM sessions WHERE state='compacting'").fetchall():
+            if old['provider'] != 'codex' and old['id'] not in reported:
+                row = dict(old)
+                recover_stale_compaction(row, now, cfg, idle_report=False)
+                if dict(old) != row:
+                    save(db, row)
         for path, (pid, start) in loaded.items():
             meta = codex_session_meta(path)
             if not meta or meta[2] in CODEX_INTERNAL:
@@ -1325,7 +1480,8 @@ def draw_ui_icon(name, size=18):
     'sound' / 'muted' (a speaker with waves or a cross), the usage-bar markers 'clock' (the 5h window)
     and 'calendar' (the weekly one), and the card marks 'long' / 'too long' (a scroll, yellow or red: the
     context has grown), 'cold' (a snowflake: the prompt cache expired) and 'struggling' (a burst: a turn
-    piling up tool errors or running very long)."""
+    piling up tool errors or running very long); the avatar badges 'agents' (a party: subagents running) and
+    'remote' / 'remote shell' (a globe, blue or amber: another machine reached)."""
     from PIL import Image, ImageDraw
     light, dark = '#d6deef', '#101830'
     im = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
@@ -1380,6 +1536,18 @@ def draw_ui_icon(name, size=18):
         d.polygon(star, fill='#ffb070', outline=ICON_BORDER)
         d.rectangle((14, 6, 17, 17), fill=dark)
         d.rectangle((14, 20, 17, 23), fill=dark)
+    elif name == 'agents':  # a party: two small figures behind a bigger one
+        party = COLORS['delegating']
+        for cx, top, r in ((8, 9, 4), (24, 9, 4), (16, 12, 5)):
+            d.ellipse((cx - r, top - r, cx + r, top + r), fill=party, outline=ICON_BORDER, width=2)
+            d.pieslice((cx - r - 3, top + r, cx + r + 3, top + 3 * r + 8), 180, 360, fill=party, outline=ICON_BORDER)
+    elif name in ('remote', 'remote shell'):  # a globe: another machine, amber when a shell ran there
+        globe = '#ffb070' if name == 'remote shell' else '#9fd8ff'
+        d.ellipse((3, 3, 29, 29), fill=globe, outline=ICON_BORDER, width=2)
+        d.ellipse((11, 4, 21, 28), outline=dark, width=2)
+        d.line((4, 16, 28, 16), fill=dark, width=2)
+        d.arc((5, -2, 27, 12), 20, 160, fill=dark, width=2)
+        d.arc((5, 20, 27, 34), 200, 340, fill=dark, width=2)
     else:  # compact
         d.rectangle((4, 14, 28, 18), fill=light, outline=ICON_BORDER)
     im = im.resize((16, 16), Image.Resampling.NEAREST)
@@ -1486,7 +1654,12 @@ HELP_MARKS = (
     ('cold', 'Cache gone cold: idle over 5 minutes, so the next message re-reads the whole context at full '
              'price. Batch follow-ups while it is warm.'),
     ('struggling', 'Trouble this turn: several tool errors, or a very long run of tool calls. Check whether '
-                   'it is stuck.'))
+                   'it is stuck.'),
+    ('agents', 'Subagents running (bottom left of the avatar), with how many. Hover for each one\'s type, '
+               'what it is doing and for how long.'),
+    ('remote shell', 'Another machine reached in the last 10 minutes (bottom right of the avatar): amber '
+                     'after ssh, scp or rsync, blue after curl, git, WebFetch and other network tools. Hover '
+                     'for every host. Only the host name is kept; "track_hosts": false turns this off.'))
 HEALTH_ADVICE = {'long': '/compact at a natural break, or a new chat for the next task',
                  'too long': 'start a fresh chat; ask for a handoff summary first'}
 
@@ -1523,6 +1696,37 @@ def session_flags(row, usage, now, cfg):
             and now - (row.get('updated') or now) >= setting(cfg, 'cache_ttl')):
         flags.append(f'cache cold: next turn re-reads {tokens(context)}')
     return flags
+
+
+def agent_badge(row, now):
+    """('×N', hover text) while subagents run: each one's type, what it is doing and for how long."""
+    agents = json.loads(row.get('subagents') or '{}')
+    if not agents:
+        return None
+    info = json.loads(row.get('agent_info') or '{}')
+    lines = []
+    for sid, started in sorted(agents.items(), key=lambda item: item[1]):
+        meta = info.get(sid) or {}
+        doing = LABELS.get(meta.get('state'), 'Running')
+        if meta.get('tool') and meta.get('state') in ('reading', 'working'):
+            doing += ' · ' + meta['tool']
+        lines.append(f'{meta.get("type") or "agent"}: {doing} · {duration(now - started)}')
+    head = f'{len(agents)} subagent' + ('s' if len(agents) > 1 else '') + ' running'
+    return f'×{len(agents)}', '\n'.join([head] + lines[:8] + ([f'+{len(lines) - 8} more'] if len(lines) > 8 else []))
+
+
+def host_badge(row, now):
+    """(icon, label, hover text) for other machines the chat reached in the last HOST_TTL seconds;
+    the amber icon when any of them was a remote shell or copy (ssh, scp, rsync), else the blue one."""
+    hosts = {k: v for k, v in json.loads(row.get('hosts') or '{}').items() if now - v[0] < HOST_TTL}
+    if not hosts:
+        return None
+    order = sorted(hosts.items(), key=lambda item: -item[1][0])
+    shell = any(via in SHELL_HOSTS for _, (_, via) in order)
+    first = order[0][0]
+    label = (first if len(first) <= 14 else first[:13] + '…') + (f' +{len(order) - 1}' if len(order) > 1 else '')
+    lines = [f'{host} · {via} · {duration(now - seen)} ago' for host, (seen, via) in order]
+    return 'remote shell' if shell else 'remote', label, '\n'.join(['Reached other machines:'] + lines)
 
 
 def hook_command():
@@ -2076,7 +2280,8 @@ def run_ui():
     verbose = [config().get('verbose', True)]
     ui_icons = {name: ImageTk.PhotoImage(draw_ui_icon(name, px(18)))
                 for name in ('help', 'details', 'compact', 'sound', 'muted', 'clock', 'calendar',
-                             'long', 'too long', 'cold', 'struggling')}
+                             'long', 'too long', 'cold', 'struggling', 'agents', 'remote', 'remote shell')}
+    badge_icons = {name: ImageTk.PhotoImage(draw_ui_icon(name, px(13))) for name in ('agents', 'remote', 'remote shell')}
     def icon_button(name):
         return tk.Button(header, name=name, image=ui_icons['help'], relief='flat', bd=0, takefocus=0,
                          bg='#202a3d', activebackground='#303e57', padx=3, pady=3,
@@ -2325,7 +2530,8 @@ def run_ui():
                                          text=meaning, width=w - 2 * pad - px(32))
                     y = max(y + px(23), c.bbox(item)[3] + px(5))
                 item = c.create_text(pad, y, anchor='nw', fill='#c2cce0', font=('Sans', 8), width=w - 2 * pad,
-                                     text='These appear after a card\'s status; hover one for its numbers.')
+                                     text='Health marks appear after a card\'s status, badges on the avatar; '
+                                          'hover one for its numbers.')
                 y = c.bbox(item)[3] + px(2)
             else:
                 item = c.create_text(pad, y, anchor='nw', text=body, width=w - 2 * pad,
@@ -2591,6 +2797,12 @@ def run_ui():
         sprite.pack()
         tag = tk.Label(frame, bg='#303e57', font=('Sans', 7, 'bold'), padx=4, pady=1)
         tag.place(relx=1.0, x=2, y=-1, anchor='ne')
+        badges = {}
+        for kind in ('agents', 'remote'):  # placed on the avatar's lower corners only while they apply
+            badges[kind] = tk.Label(frame, bg='#303e57', fg='#e7efff', font=('Sans', 8, 'bold'), padx=3, pady=0,
+                                    compound='left')
+            badges[kind].bind('<Enter>', lambda e, w=badges[kind]: show_tip(w))
+            badges[kind].bind('<Leave>', hide_tip)
         name_row = tk.Frame(frame, bg='#202a3d')
         name_row.pack(fill='x')
         button = tk.Button(name_row, command=lambda s=sid: open_picker(s), relief='flat', bg='#303e57', fg='#e7efff',
@@ -2618,7 +2830,7 @@ def run_ui():
         text.pack(fill='x')
         bar.pack(fill='x', pady=(3, 0))
         return dict(frame=frame, sprite=sprite, tag=tag, button=button, mute=mute, label=label, icon=icon, status=status,
-                    info=info, text=text, bar=bar, marks=marks, key=None, index=0, due=0, shown=None,
+                    info=info, text=text, bar=bar, marks=marks, badges=badges, key=None, index=0, due=0, shown=None,
                     tint_widgets=(frame, sprite, name_row, label, status_row, icon, status, *marks.values(), info, text))
     feeds, prefs, feed_info = {}, load_remote_prefs(), [None]
     def remote_sessions(now):
@@ -2704,6 +2916,18 @@ def run_ui():
             shown_marks = {'health': level in HEALTH_ADVICE and (level, f'{why}: {HEALTH_ADVICE[level]}'),
                            'cold': next((('cold', f) for f in flags if f.startswith('cache cold')), None),
                            'struggling': next((('struggling', f) for f in flags if not f.startswith('cache cold')), None)}
+            shown_badges = {'agents': (lambda b: b and ('agents', *b))(agent_badge(row, now)),
+                            'remote': host_badge(row, now)}
+            for kind, badge in card['badges'].items():
+                glyph = shown_badges[kind]
+                if glyph:
+                    badge.configure(image=badge_icons[glyph[0]], text=glyph[1])
+                    badge.tip = glyph[2]
+                    if not badge.winfo_manager():
+                        left = kind == 'agents'
+                        badge.place(relx=0 if left else 1.0, y=sprite_h + 7, anchor='sw' if left else 'se')
+                elif badge.winfo_manager():
+                    badge.place_forget()
             for kind, mark in card['marks'].items():
                 glyph = shown_marks[kind]
                 if glyph:
@@ -2836,6 +3060,9 @@ def remote_rows(host, sessions, offset, online, prefs, names):
         for key in REMOTE_TIMES:
             if isinstance(row.get(key), (int, float)):
                 row[key] += offset
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            row['subagents'] = json.dumps({k: v + offset for k, v in json.loads(row.get('subagents') or '{}').items()})
+            row['hosts'] = json.dumps({k: [v[0] + offset, v[1]] for k, v in json.loads(row.get('hosts') or '{}').items()})
         pref = prefs.setdefault(row['id'], {})
         if pref.get('avatar') not in names and names:
             pref['avatar'] = names[sum(1 for p in prefs.values() if p.get('avatar')) % len(names)]

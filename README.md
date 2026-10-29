@@ -13,13 +13,14 @@ The preview is recorded from the real window, using placeholder chats, a placeho
 - A stable avatar choice per chat, with optional randomized working scenes and an idle scene. Click the name under a card's avatar to open the picker and choose a different character for that chat.
 - Account usage per provider, as two bars each: a clock for the 5-hour window and a calendar for the weekly one, with the share left and the time until reset.
 - Per-chat details: session age, active time, prompt and tool counts, context used, tokens in and out, model, and calls. The lines button switches between full and compact cards. Prompt and tool contents are not stored by the monitor.
+- Badges on the avatar for running subagents and for other machines the chat has reached over SSH or the network.
 - A `?` help panel that explains every state icon, the usage bars, and the card details.
 
 Codex chats can be detected from their local rollout metadata before hooks are trusted. Detailed Codex tool and permission states require approving the configured hooks in Codex's **Hooks need review** prompt or `/hooks`.
 
 Tool states recognize Codex's dotted and MCP names. File and web reads use Reading; planning and waiting for tool output use Thinking; agent calls use Delegating; user questions use Needs input; edits, image generation and other commands use Working. For `exec` wrappers, the monitor briefly inspects explicit nested tool names and simple read-only shell commands such as `rg`, `cat` and `git diff`. Mixed or ambiguous commands stay Working. Only the resolved tool name is retained, never the supplied code or command arguments; long MCP prefixes are removed from the card label.
 
-Claude cards recover from a missed compaction completion hook: if Claude reports Idle and both hooks and transcript writes have been quiet for five minutes, the card falls back to `Idle · detected`. This estimate is saved across monitor restarts; the next hook restores live tracking. A compaction that runs silently longer than the grace period can also trigger this estimate. Set `"compact_stale_after": 600` in the monitor's `config.json` for a longer grace period (seconds), or `0` to disable this fallback. Busy reports, recent activity and missing transcripts prevent the fallback.
+Claude cards recover from a missed compaction completion hook: if Claude reports Idle and both hooks and transcript writes have been quiet for five minutes, the card falls back to `Idle · detected`. This estimate is saved across monitor restarts; the next hook restores live tracking. A compaction that runs silently longer than the grace period can also trigger this estimate. Set `"compact_stale_after": 600` in the monitor's `config.json` for a longer grace period (seconds), or `0` to disable this fallback. Busy reports, recent activity and missing transcripts prevent the fallback, except for an orphaned chat: when Claude has dropped both its session metadata and its transcript while the process lingers (a closed or deleted chat), five minutes without a hook is enough.
 
 ## Requirements
 
@@ -47,6 +48,15 @@ Small marks after a card's status show when a chat needs attention; nothing show
 | burst | several tool errors this turn, or a very long run of tool calls | check whether the agent is stuck |
 
 Only Needs input and Error chime by default, at most once a minute per chat. Add `"ready"` to `"chimes"` in `config.json` for a chime after every turn, or set `"chimes": []` for none. The thresholds are adjustable in `config.json` too; see SKILL.md.
+
+## Subagents and other machines
+
+Two small badges on the avatar's lower corners show work happening away from the main chat. They appear only while they apply, and hovering one shows the details:
+
+- **Bottom left, a party with `×N`:** subagents are running. Hover to see each one's type, what it is doing (for example `Explore: Reading · Grep`) and how long it has run. A subagent's tokens and calls are added to its parent card; subagents never get their own card.
+- **Bottom right, a globe with a host name:** the chat, or one of its subagents, reached another machine in the last 10 minutes. The globe is amber after `ssh`, `scp` or `rsync` and blue after `curl`, `wget`, `git` remotes, `WebFetch` and similar tools. `+N` counts further hosts; hover to list them all.
+
+Only the host name and the command name are kept, never the rest of the command. Loopback addresses and this machine are ignored. Hosts given through shell variables, or reached from inside a script the agent runs, are not detected. Set `"track_hosts": false` in `config.json` to turn host tracking off.
 
 ## Remote machines
 
